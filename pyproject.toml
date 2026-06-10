@@ -1,0 +1,27 @@
+[project]
+name = "share-tools"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.13"
+dependencies = []
+
+[dependency-groups]
+dev = [
+    "anki>=25.9.4",
+    "aqt>=25.9.4",
+    "pyright>=1.1.407",
+    "pytest>=9.0.2",
+    "ruff>=0.15.16",
+]
+
+[tool.pyright]
+include = ["addon", "scripts", "tests"]
+extraPaths = ["addon"]
+typeCheckingMode = "basic"
+reportArgumentType = false
+reportOptionalMemberAccess = false
+reportPrivateImportUsage = false
+
+[tool.pytest.ini_options]
+pythonpath = ["addon"]
