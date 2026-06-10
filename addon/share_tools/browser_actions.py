@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Any
+from typing import Any, Optional
 
 from aqt import gui_hooks, mw
 from aqt.browser import Browser
@@ -202,7 +202,7 @@ def choose_tags_if_needed(
     title: str,
     label: str,
     force_single: bool = False,
-) -> list[str] | None:
+) -> Optional[list[str]]:
     if not class_tags:
         return []
 

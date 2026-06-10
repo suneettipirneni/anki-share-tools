@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from datetime import date
 import re
+from typing import Iterable
 
 
 DEFAULT_SHARE_TAG_PREFIX = "share_unsuspended"
@@ -30,7 +31,7 @@ def normalize_tag_part(value: str) -> str:
     return cleaned.strip("_")
 
 
-def build_nid_query(note_ids: list[int] | set[int]) -> str:
+def build_nid_query(note_ids: Iterable[int]) -> str:
     unique_note_ids = sorted(set(note_ids))
 
     if not unique_note_ids:
