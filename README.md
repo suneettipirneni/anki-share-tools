@@ -2,6 +2,7 @@
 
 An Anki add-on for copying shareable browser queries and tagging unsuspended class subsets.
 
+https://github.com/user-attachments/assets/8cb20b97-80f0-43b8-bace-2808e15ac6c8
 
 https://github.com/user-attachments/assets/6f5d154d-e3a1-412a-9070-a2b37e450d46
 
