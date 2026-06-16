@@ -17,6 +17,7 @@ from share_tools.unsuspend_tracker import (
     load_state,
     lock_scope,
     record_snapshot,
+    remove_captured_cids,
     save_state,
     apply_state,
 )
@@ -68,6 +69,26 @@ def test_duplicate_snapshots_do_not_duplicate_events() -> None:
         FreshnessWindow.TODAY,
         now=datetime(2026, 6, 15, 12),
     ) == [20]
+
+
+def test_resuspended_cards_are_removed_from_captured_events() -> None:
+    lock_scope("tag:class::cardiology", [10, 20])
+    record_snapshot([10], cid_to_nid, now=datetime(2026, 6, 15, 10))
+
+    record_snapshot([10, 20], cid_to_nid, now=datetime(2026, 6, 15, 11))
+
+    assert get_captured_events() == []
+
+
+def test_remove_captured_cids_removes_matching_events_only() -> None:
+    lock_scope("tag:class::cardiology", [10, 20, 30])
+    record_snapshot([], cid_to_nid, now=datetime(2026, 6, 15, 10))
+
+    assert remove_captured_cids([20, 40]) == 1
+    assert get_captured_cids_for_window(
+        FreshnessWindow.TODAY,
+        now=datetime(2026, 6, 15, 12),
+    ) == [10, 30]
 
 
 def test_captured_cids_are_sorted() -> None:

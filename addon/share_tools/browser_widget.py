@@ -6,11 +6,14 @@ from aqt import mw
 from aqt.browser import Browser
 from aqt.qt import (
     QApplication,
+    QAbstractItemView,
+    QAction,
     QComboBox,
     QDockWidget,
     QHBoxLayout,
     QLabel,
     QInputDialog,
+    QMenu,
     QPushButton,
     QTimer,
     QTableWidget,
@@ -57,7 +60,14 @@ class UnsuspendTrackerWidget(QWidget):
         )
         self.events_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
         self.events_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.events_table.setSelectionMode(
+            QAbstractItemView.SelectionMode.ExtendedSelection
+        )
         self.events_table.setAlternatingRowColors(True)
+        self.events_table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.events_table.customContextMenuRequested.connect(
+            self.show_events_table_context_menu
+        )
         self.events_table.verticalHeader().setVisible(False)
         self.events_table.horizontalHeader().setStretchLastSection(True)
         self.events_table.setMinimumHeight(180)
@@ -154,9 +164,53 @@ class UnsuspendTrackerWidget(QWidget):
             for column, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                if column == 3:
+                    item.setData(Qt.ItemDataRole.UserRole, event.cid)
                 self.events_table.setItem(row, column, item)
 
         self.events_table.resizeColumnsToContents()
+
+    def show_events_table_context_menu(self, position) -> None:
+        selected_card_ids = self.selected_event_card_ids()
+
+        if not selected_card_ids:
+            return
+
+        menu = QMenu(self.events_table)
+        remove_action = QAction("Remove fresh unsuspend", menu)
+        remove_action.triggered.connect(
+            lambda: self.remove_selected_fresh_unsuspends(selected_card_ids)
+        )
+        menu.addAction(remove_action)
+        menu.exec(self.events_table.viewport().mapToGlobal(position))
+
+    def selected_event_card_ids(self) -> list[int]:
+        card_ids: set[int] = set()
+
+        for item in self.events_table.selectedItems():
+            row = item.row()
+            card_id_item = self.events_table.item(row, 3)
+
+            if card_id_item is None:
+                continue
+
+            card_id = card_id_item.data(Qt.ItemDataRole.UserRole)
+
+            if card_id is None:
+                continue
+
+            card_ids.add(int(card_id))
+
+        return sorted(card_ids)
+
+    def remove_selected_fresh_unsuspends(self, card_ids: list[int]) -> None:
+        removed_count = unsuspend_tracker.remove_captured_cids(card_ids)
+
+        if removed_count:
+            save_tracker_state()
+
+        self.update_view()
+        tooltip(f"Removed {removed_count} fresh unsuspend(s).")
 
     def lock_current_search(self) -> None:
         scope_query = normalize_scope_query(get_browser_search_text(self.browser))

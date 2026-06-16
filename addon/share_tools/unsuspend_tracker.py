@@ -58,6 +58,7 @@ def record_snapshot(
 
     detected_at = now or datetime.now()
     current_suspended = {int(cid) for cid in current_suspended_cids}
+    remove_captured_cids(current_suspended)
     newly_unsuspended = sorted(_previous_suspended_cids - current_suspended)
     new_events: list[UnsuspendEvent] = []
 
@@ -131,6 +132,16 @@ def count_for_window(window: FreshnessWindow, now: Optional[datetime] = None) ->
 
 def clear_captured() -> None:
     _captured_events_by_cid.clear()
+
+
+def remove_captured_cids(card_ids: Iterable[int]) -> int:
+    removed_count = 0
+
+    for cid in set(int(card_id) for card_id in card_ids):
+        if _captured_events_by_cid.pop(cid, None) is not None:
+            removed_count += 1
+
+    return removed_count
 
 
 def clear_all() -> None:
