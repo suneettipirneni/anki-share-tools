@@ -20,8 +20,17 @@ Install the add-on from the packaged `.ankiaddon` file:
 
 ## What It Adds
 
-After restarting Anki, Share Tools appears in the browser context menu when you right-click
-selected cards.
+After restarting Anki, Share Tools adds a Browser panel for passive unsuspend tracking
+and a context menu when you right-click selected cards.
+
+The Browser panel lets you:
+
+- Lock the current search as the tracking scope.
+- Passively capture cards that become unsuspended while Anki is open.
+- Keep captured unsuspensions across Anki restarts.
+- Switch between Today and This week freshness windows.
+- Copy an exact `cid:` query for freshly unsuspended cards.
+- Optionally tag parent notes for friend-facing sharing.
 
 It exposes these actions under the Share Tools menu:
 

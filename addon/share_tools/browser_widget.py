@@ -1,0 +1,416 @@
+from datetime import datetime
+from pathlib import Path
+from weakref import WeakSet
+
+from aqt import mw
+from aqt.browser import Browser
+from aqt.qt import (
+    QApplication,
+    QComboBox,
+    QDockWidget,
+    QHBoxLayout,
+    QLabel,
+    QInputDialog,
+    QPushButton,
+    QTimer,
+    QTableWidget,
+    QTableWidgetItem,
+    QVBoxLayout,
+    QWidget,
+    Qt,
+    sip,
+)
+from aqt.utils import askUser, showInfo, tooltip
+
+from .queries import build_cid_query, build_tag_query
+from . import unsuspend_tracker
+from .unsuspend_tracker import FreshnessWindow
+
+
+STATE_FILE = Path(__file__).resolve().parents[1] / "unsuspend_tracker_state.json"
+TIMER_INTERVAL_MS = 2000
+DOCK_ATTRIBUTE = "_share_tools_unsuspend_tracker_dock"
+TOGGLE_SUSPEND_ACTION_ATTRIBUTE = "_share_tools_toggle_suspend_refresh_connected"
+_state_loaded = False
+_widgets: WeakSet["UnsuspendTrackerWidget"] = WeakSet()
+
+
+class UnsuspendTrackerWidget(QWidget):
+    def __init__(self, browser: Browser) -> None:
+        super().__init__(browser)
+        self.browser = browser
+        self.timer = QTimer(self)
+        self.timer.setInterval(TIMER_INTERVAL_MS)
+        self.timer.timeout.connect(self.on_timer_tick)
+
+        self.tracking_label = QLabel(self)
+        self.scope_label = QLabel(self)
+        self.scope_label.setWordWrap(True)
+        self.count_label = QLabel(self)
+        self.window_combo = QComboBox(self)
+        self.window_combo.addItem("Today", FreshnessWindow.TODAY.value)
+        self.window_combo.addItem("This week", FreshnessWindow.THIS_WEEK.value)
+        self.window_combo.currentIndexChanged.connect(lambda _: self.update_view())
+        self.events_table = QTableWidget(0, 6, self)
+        self.events_table.setHorizontalHeaderLabels(
+            ["Detected", "Sort field", "Card type", "Card ID", "Note ID", "Scope"]
+        )
+        self.events_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+        self.events_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.events_table.setAlternatingRowColors(True)
+        self.events_table.verticalHeader().setVisible(False)
+        self.events_table.horizontalHeader().setStretchLastSection(True)
+        self.events_table.setMinimumHeight(180)
+
+        self.lock_button = QPushButton("Lock current search", self)
+        self.lock_button.clicked.connect(self.lock_current_search)
+
+        self.refresh_button = QPushButton("Refresh", self)
+        self.refresh_button.clicked.connect(lambda: self.refresh(show_errors=True))
+
+        self.copy_button = QPushButton("Copy fresh card query", self)
+        self.copy_button.clicked.connect(self.copy_fresh_card_query)
+
+        self.tag_button = QPushButton("Tag parent notes for fresh cards...", self)
+        self.tag_button.clicked.connect(self.tag_parent_notes_for_fresh_cards)
+
+        self.clear_button = QPushButton("Clear captured", self)
+        self.clear_button.clicked.connect(self.clear_captured)
+        self.destroyed.connect(lambda: unregister_tracker_widget(self))
+
+        self.setup_layout()
+        self.update_view()
+        self.timer.start()
+
+    def setup_layout(self) -> None:
+        layout = QVBoxLayout()
+        layout.addWidget(self.tracking_label)
+        layout.addWidget(self.scope_label)
+
+        window_layout = QHBoxLayout()
+        window_layout.addWidget(QLabel("Window:", self))
+        window_layout.addWidget(self.window_combo)
+        layout.addLayout(window_layout)
+
+        layout.addWidget(self.count_label)
+        layout.addWidget(self.events_table)
+        layout.addWidget(self.lock_button)
+        layout.addWidget(self.refresh_button)
+        layout.addWidget(self.copy_button)
+        layout.addWidget(self.tag_button)
+        layout.addWidget(self.clear_button)
+        layout.addStretch(1)
+        self.setLayout(layout)
+
+    def selected_window(self) -> FreshnessWindow:
+        if not is_widget_alive(self.window_combo):
+            return FreshnessWindow.TODAY
+
+        value = self.window_combo.currentData()
+        if value == FreshnessWindow.THIS_WEEK.value:
+            return FreshnessWindow.THIS_WEEK
+        return FreshnessWindow.TODAY
+
+    def update_view(self) -> None:
+        if not is_widget_alive(self):
+            return
+
+        tracking_status = "On" if unsuspend_tracker.is_tracking_enabled() else "Off"
+        scope_query = unsuspend_tracker.get_locked_scope_query()
+        if scope_query is None:
+            scope_text = "No scope locked"
+        elif scope_query:
+            scope_text = scope_query
+        else:
+            scope_text = "Whole collection"
+        count = unsuspend_tracker.count_for_window(self.selected_window())
+
+        self.tracking_label.setText(f"Tracking: {tracking_status}")
+        self.scope_label.setText(f"Scope: {scope_text}")
+        self.count_label.setText(f"Fresh captured: {count} card(s)")
+        self.update_events_table()
+
+    def update_events_table(self) -> None:
+        if not is_widget_alive(self.events_table):
+            return
+
+        events = unsuspend_tracker.get_captured_events_for_window(
+            self.selected_window()
+        )
+        self.events_table.setRowCount(len(events))
+
+        for row, event in enumerate(events):
+            sort_field = get_note_sort_field(event.nid)
+            card_type = get_card_type_name(event.cid)
+            values = [
+                event.detected_at.strftime("%Y-%m-%d %H:%M:%S"),
+                sort_field,
+                card_type,
+                str(event.cid),
+                str(event.nid),
+                event.scope_query or "Whole collection",
+            ]
+
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
+                self.events_table.setItem(row, column, item)
+
+        self.events_table.resizeColumnsToContents()
+
+    def lock_current_search(self) -> None:
+        scope_query = normalize_scope_query(get_browser_search_text(self.browser))
+
+        if not scope_query and not askUser(
+            "The current search is empty. Locking an empty scope means tracking "
+            "unsuspensions across the whole collection. Continue?"
+        ):
+            return
+
+        suspended_cids = find_suspended_cids_in_scope(scope_query)
+        unsuspend_tracker.lock_scope(scope_query, suspended_cids)
+        save_tracker_state()
+        self.update_view()
+        tooltip(f"Locked scope with {len(suspended_cids)} suspended card(s).")
+
+    def on_timer_tick(self) -> None:
+        self.refresh(show_errors=False)
+
+    def refresh(self, show_errors: bool = False) -> None:
+        if not is_widget_alive(self):
+            return
+
+        if (
+            not unsuspend_tracker.is_tracking_enabled()
+            or unsuspend_tracker.get_locked_scope_query() is None
+        ):
+            self.update_view()
+            return
+
+        try:
+            scope_query = unsuspend_tracker.get_locked_scope_query() or ""
+            current_suspended_cids = find_suspended_cids_in_scope(scope_query)
+            unsuspend_tracker.record_snapshot(
+                current_suspended_cids=current_suspended_cids,
+                cid_to_nid=cid_to_nid,
+            )
+            save_tracker_state()
+        except Exception as exc:
+            if show_errors:
+                showInfo(f"Could not refresh unsuspend tracker:\n\n{exc}")
+
+        self.update_view()
+
+    def copy_fresh_card_query(self) -> None:
+        card_ids = unsuspend_tracker.get_captured_cids_for_window(
+            self.selected_window()
+        )
+
+        if not card_ids:
+            showInfo("No fresh unsuspended cards found for the selected window.")
+            return
+
+        query = build_cid_query(card_ids)
+        QApplication.clipboard().setText(query)
+        tooltip(f"Copied query for {len(card_ids)} fresh card(s).")
+
+    def tag_parent_notes_for_fresh_cards(self) -> None:
+        note_ids = unsuspend_tracker.get_captured_nids_for_window(
+            self.selected_window()
+        )
+
+        if not note_ids:
+            showInfo("No fresh unsuspended cards found for the selected window.")
+            return
+
+        default_tag = default_share_tag_for_window(self.selected_window())
+        tag, ok = QInputDialog.getText(
+            self,
+            "Share tag",
+            "Tag to add to parent notes:",
+            text=default_tag,
+        )
+
+        if not ok:
+            return
+
+        tag = tag.strip()
+
+        if not tag:
+            showInfo("Share tag cannot be empty.")
+            return
+
+        for nid in note_ids:
+            note = mw.col.get_note(nid)
+            note.add_tag(tag)
+            mw.col.update_note(note)
+
+        mw.col.save()
+        QApplication.clipboard().setText(build_tag_query(tag))
+        tooltip(f"Tagged {len(note_ids)} parent note(s) and copied share query.")
+
+    def clear_captured(self) -> None:
+        unsuspend_tracker.clear_captured()
+        save_tracker_state()
+        self.update_view()
+
+
+def attach_unsuspend_tracker_widget(browser: Browser) -> None:
+    load_tracker_state_once()
+    ensure_default_scope_locked()
+    connect_toggle_suspend_action(browser)
+
+    if getattr(browser, DOCK_ATTRIBUTE, None) is not None:
+        return
+
+    widget = UnsuspendTrackerWidget(browser)
+    _widgets.add(widget)
+    dock = QDockWidget("Share Tools", browser)
+    dock.setObjectName("share_tools_unsuspend_tracker")
+    dock.setWidget(widget)
+    browser.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
+    setattr(browser, DOCK_ATTRIBUTE, dock)
+
+
+def ensure_default_scope_locked() -> None:
+    if unsuspend_tracker.get_locked_scope_query() is not None:
+        return
+
+    suspended_cids = find_suspended_cids_in_scope("")
+    unsuspend_tracker.lock_scope("", suspended_cids)
+    save_tracker_state()
+
+
+def connect_toggle_suspend_action(browser: Browser) -> None:
+    if getattr(browser, TOGGLE_SUSPEND_ACTION_ATTRIBUTE, False):
+        return
+
+    action = getattr(getattr(browser, "form", None), "actionToggle_Suspend", None)
+
+    if action is None:
+        return
+
+    action.triggered.connect(lambda _checked=False: refresh_tracker_widgets_after_delay())
+    setattr(browser, TOGGLE_SUSPEND_ACTION_ATTRIBUTE, True)
+
+
+def refresh_tracker_widgets_after_delay() -> None:
+    QTimer.singleShot(750, refresh_tracker_widgets)
+    QTimer.singleShot(2000, refresh_tracker_widgets)
+
+
+def refresh_tracker_widgets() -> None:
+    for widget in list(_widgets):
+        if not is_widget_alive(widget):
+            unregister_tracker_widget(widget)
+            continue
+
+        widget.refresh(show_errors=False)
+
+
+def unregister_tracker_widget(widget: "UnsuspendTrackerWidget") -> None:
+    _widgets.discard(widget)
+
+    if is_widget_alive(widget.timer):
+        widget.timer.stop()
+
+
+def is_widget_alive(widget: object) -> bool:
+    try:
+        return not sip.isdeleted(widget)
+    except RuntimeError:
+        return False
+
+
+def get_browser_search_text(browser: Browser) -> str:
+    current_search = getattr(browser, "current_search", None)
+
+    if callable(current_search):
+        return str(current_search()).strip()
+
+    search_edit = getattr(getattr(browser, "form", None), "searchEdit", None)
+    line_edit = search_edit.lineEdit() if search_edit is not None else None
+
+    if line_edit is not None:
+        return str(line_edit.text()).strip()
+
+    return ""
+
+
+def normalize_scope_query(query: str) -> str:
+    parts = [
+        part
+        for part in query.strip().split()
+        if part not in {"is:suspended", "-is:suspended"}
+    ]
+    return " ".join(parts)
+
+
+def build_suspended_scope_query(scope_query: str) -> str:
+    scope_query = scope_query.strip()
+
+    if not scope_query:
+        return "is:suspended"
+
+    return f"({scope_query}) is:suspended"
+
+
+def find_suspended_cids_in_scope(scope_query: str) -> list[int]:
+    query = build_suspended_scope_query(scope_query)
+    return sorted(int(cid) for cid in mw.col.find_cards(query))
+
+
+def cid_to_nid(cid: int) -> int:
+    return int(mw.col.get_card(cid).nid)
+
+
+def get_note_sort_field(nid: int) -> str:
+    try:
+        note = mw.col.get_note(nid)
+        sort_field = getattr(note, "sfld", None)
+
+        if sort_field:
+            return str(sort_field)
+
+        model = note.note_type()
+        sort_index = int(model.get("sortf", 0))
+        return str(note.fields[sort_index])
+    except Exception:
+        return ""
+
+
+def get_card_type_name(cid: int) -> str:
+    try:
+        card = mw.col.get_card(cid)
+        template = card.template()
+
+        if isinstance(template, dict):
+            return str(template.get("name", ""))
+
+        return str(getattr(template, "name", ""))
+    except Exception:
+        return ""
+
+
+def default_share_tag_for_window(window: FreshnessWindow) -> str:
+    now = datetime.now()
+
+    if window == FreshnessWindow.THIS_WEEK:
+        week_start = unsuspend_tracker.start_of_week(now).date()
+        return f"share_unsuspended::week_{week_start.isoformat().replace('-', '_')}"
+
+    return f"share_unsuspended::{now.date().isoformat().replace('-', '_')}"
+
+
+def save_tracker_state() -> None:
+    unsuspend_tracker.save_state(STATE_FILE)
+
+
+def load_tracker_state_once() -> None:
+    global _state_loaded
+
+    if _state_loaded:
+        return
+
+    unsuspend_tracker.load_state(STATE_FILE)
+    _state_loaded = True

@@ -40,6 +40,15 @@ def build_nid_query(note_ids: Iterable[int]) -> str:
     return "(" + " OR ".join(f"nid:{nid}" for nid in unique_note_ids) + ")"
 
 
+def build_cid_query(card_ids: Iterable[int]) -> str:
+    unique_card_ids = sorted(set(card_ids))
+
+    if not unique_card_ids:
+        raise ValueError("No card IDs provided.")
+
+    return "(" + " OR ".join(f"cid:{cid}" for cid in unique_card_ids) + ")"
+
+
 def build_tag_query(tag: str) -> str:
     if not tag.strip():
         raise ValueError("Tag cannot be empty.")

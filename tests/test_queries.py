@@ -4,6 +4,7 @@ import pytest
 
 from share_tools.queries import (
     ShareTag,
+    build_cid_query,
     build_class_query,
     build_nid_query,
     build_unsuspended_tag_query,
@@ -14,6 +15,15 @@ from share_tools.queries import (
 
 def test_build_nid_query_deduplicates_and_sorts() -> None:
     assert build_nid_query([3, 1, 3, 2]) == "(nid:1 OR nid:2 OR nid:3)"
+
+
+def test_build_cid_query_deduplicates_and_sorts() -> None:
+    assert build_cid_query({3, 1, 3}) == "(cid:1 OR cid:3)"
+
+
+def test_empty_cid_query_raises() -> None:
+    with pytest.raises(ValueError, match="No card IDs provided"):
+        build_cid_query([])
 
 
 def test_build_class_query_excludes_suspended_by_default() -> None:
