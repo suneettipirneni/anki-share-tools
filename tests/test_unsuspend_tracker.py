@@ -20,6 +20,7 @@ from share_tools.unsuspend_tracker import (
     remove_captured_cids,
     save_state,
     apply_state,
+    sync_baseline_without_capturing,
 )
 
 
@@ -76,6 +77,24 @@ def test_resuspended_cards_are_removed_from_captured_events() -> None:
     record_snapshot([10], cid_to_nid, now=datetime(2026, 6, 15, 10))
 
     record_snapshot([10, 20], cid_to_nid, now=datetime(2026, 6, 15, 11))
+
+    assert get_captured_events() == []
+
+
+def test_sync_baseline_without_capturing_ignores_patch_unsuspends() -> None:
+    lock_scope("tag:class::cardiology", [10, 20, 30])
+
+    sync_baseline_without_capturing([10])
+
+    assert get_captured_events() == []
+    assert record_snapshot([10], cid_to_nid, now=datetime(2026, 6, 15, 10)) == []
+
+
+def test_sync_baseline_without_capturing_removes_resuspended_captured_cards() -> None:
+    lock_scope("tag:class::cardiology", [10, 20])
+    record_snapshot([10], cid_to_nid, now=datetime(2026, 6, 15, 10))
+
+    sync_baseline_without_capturing([10, 20])
 
     assert get_captured_events() == []
 

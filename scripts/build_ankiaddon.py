@@ -22,6 +22,7 @@ REQUIRED_NAMES = {
     "manifest.json",
     "__init__.py",
     "share_tools/__init__.py",
+    "share_tools/ankipatch.py",
     "share_tools/browser_actions.py",
     "share_tools/browser_widget.py",
     "share_tools/queries.py",

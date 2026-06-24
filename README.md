@@ -1,6 +1,7 @@
 # Share Tools
 
-An Anki add-on for copying shareable browser queries and tagging unsuspended class subsets.
+An Anki add-on for exporting and applying portable `.ankipatch` files for suspended
+and unsuspended card state.
 
 
 https://github.com/user-attachments/assets/6f5d154d-e3a1-412a-9070-a2b37e450d46
@@ -29,14 +30,17 @@ The Browser panel lets you:
 - Passively capture cards that become unsuspended while Anki is open.
 - Keep captured unsuspensions across Anki restarts.
 - Switch between Today and This week freshness windows.
-- Copy an exact `cid:` query for freshly unsuspended cards.
-- Optionally tag parent notes for friend-facing sharing.
+- Export fresh unsuspensions as a portable `.ankipatch`.
+- Apply a received `.ankipatch` and review per-card results.
 
 It exposes these actions under the Share Tools menu:
 
-- Copy exact selected notes query: copies an Anki search query for the selected notes by note ID.
-- Copy class query excluding suspended: infers selected `class::` tags and copies a query for those class cards while excluding suspended cards.
-- Tag current unsuspended class subset: tags the current unsuspended cards for a selected class with a temporary `share_unsuspended::...` tag, then copies a query for that share tag.
+- Show fresh cards panel: reopens the Browser side panel if it was hidden.
+- Export selected cards as ankipatch: saves selected cards with portable note GUID, card ordinal, and suspended/unsuspended state.
+- Export current unsuspended class subset as ankipatch: infers the selected `class::` tag and exports matching unsuspended cards.
+- Apply ankipatch: resolves each patch row against the local collection and reports successful and unsuccessful applications.
+
+You can also apply an `.ankipatch` from Anki's Tools menu.
 
 ## Development
 

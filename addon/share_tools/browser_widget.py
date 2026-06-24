@@ -5,14 +5,13 @@ from weakref import WeakSet
 from aqt import mw
 from aqt.browser import Browser
 from aqt.qt import (
-    QApplication,
     QAbstractItemView,
     QAction,
     QComboBox,
     QDockWidget,
+    QFileDialog,
     QHBoxLayout,
     QLabel,
-    QInputDialog,
     QMenu,
     QPushButton,
     QTimer,
@@ -25,7 +24,12 @@ from aqt.qt import (
 )
 from aqt.utils import askUser, showInfo, tooltip
 
-from .queries import build_cid_query, build_tag_query
+from .ankipatch import (
+    AnkiPatch,
+    card_rows_from_card_ids,
+    ensure_ankipatch_suffix,
+    write_patch,
+)
 from . import unsuspend_tracker
 from .unsuspend_tracker import FreshnessWindow
 
@@ -78,11 +82,11 @@ class UnsuspendTrackerWidget(QWidget):
         self.refresh_button = QPushButton("Refresh", self)
         self.refresh_button.clicked.connect(lambda: self.refresh(show_errors=True))
 
-        self.copy_button = QPushButton("Copy fresh card query", self)
-        self.copy_button.clicked.connect(self.copy_fresh_card_query)
+        self.export_patch_button = QPushButton("Export fresh card patch...", self)
+        self.export_patch_button.clicked.connect(self.export_fresh_card_patch)
 
-        self.tag_button = QPushButton("Tag parent notes for fresh cards...", self)
-        self.tag_button.clicked.connect(self.tag_parent_notes_for_fresh_cards)
+        self.apply_patch_button = QPushButton("Apply patch file...", self)
+        self.apply_patch_button.clicked.connect(self.apply_patch_file)
 
         self.clear_button = QPushButton("Clear captured", self)
         self.clear_button.clicked.connect(self.clear_captured)
@@ -106,8 +110,8 @@ class UnsuspendTrackerWidget(QWidget):
         layout.addWidget(self.events_table)
         layout.addWidget(self.lock_button)
         layout.addWidget(self.refresh_button)
-        layout.addWidget(self.copy_button)
-        layout.addWidget(self.tag_button)
+        layout.addWidget(self.export_patch_button)
+        layout.addWidget(self.apply_patch_button)
         layout.addWidget(self.clear_button)
         layout.addStretch(1)
         self.setLayout(layout)
@@ -255,7 +259,7 @@ class UnsuspendTrackerWidget(QWidget):
 
         self.update_view()
 
-    def copy_fresh_card_query(self) -> None:
+    def export_fresh_card_patch(self) -> None:
         card_ids = unsuspend_tracker.get_captured_cids_for_window(
             self.selected_window()
         )
@@ -264,44 +268,36 @@ class UnsuspendTrackerWidget(QWidget):
             showInfo("No fresh unsuspended cards found for the selected window.")
             return
 
-        query = build_cid_query(card_ids)
-        QApplication.clipboard().setText(query)
-        tooltip(f"Copied query for {len(card_ids)} fresh card(s).")
-
-    def tag_parent_notes_for_fresh_cards(self) -> None:
-        note_ids = unsuspend_tracker.get_captured_nids_for_window(
-            self.selected_window()
-        )
-
-        if not note_ids:
-            showInfo("No fresh unsuspended cards found for the selected window.")
+        try:
+            rows = card_rows_from_card_ids(mw.col, card_ids)
+        except Exception as exc:
+            showInfo(f"Could not build ankipatch:\n\n{exc}")
             return
 
-        default_tag = default_share_tag_for_window(self.selected_window())
-        tag, ok = QInputDialog.getText(
+        selected_path, _filter = QFileDialog.getSaveFileName(
             self,
-            "Share tag",
-            "Tag to add to parent notes:",
-            text=default_tag,
+            "Save ankipatch",
+            default_ankipatch_filename(self.selected_window()),
+            "Anki patch (*.ankipatch)",
         )
 
-        if not ok:
+        if not selected_path:
             return
 
-        tag = tag.strip()
+        path = ensure_ankipatch_suffix(Path(selected_path))
 
-        if not tag:
-            showInfo("Share tag cannot be empty.")
+        try:
+            write_patch(path, AnkiPatch(cards=rows))
+        except Exception as exc:
+            showInfo(f"Could not save ankipatch:\n\n{exc}")
             return
 
-        for nid in note_ids:
-            note = mw.col.get_note(nid)
-            note.add_tag(tag)
-            mw.col.update_note(note)
+        tooltip(f"Saved ankipatch with {len(rows)} fresh card(s).")
 
-        mw.col.save()
-        QApplication.clipboard().setText(build_tag_query(tag))
-        tooltip(f"Tagged {len(note_ids)} parent note(s) and copied share query.")
+    def apply_patch_file(self) -> None:
+        from .browser_actions import apply_ankipatch_from_file
+
+        apply_ankipatch_from_file(self)
 
     def clear_captured(self) -> None:
         unsuspend_tracker.clear_captured()
@@ -314,7 +310,26 @@ def attach_unsuspend_tracker_widget(browser: Browser) -> None:
     ensure_default_scope_locked()
     connect_toggle_suspend_action(browser)
 
-    if getattr(browser, DOCK_ATTRIBUTE, None) is not None:
+    ensure_unsuspend_tracker_dock(browser, show=False)
+
+
+def show_unsuspend_tracker_widget(browser: Browser) -> None:
+    load_tracker_state_once()
+    ensure_default_scope_locked()
+    connect_toggle_suspend_action(browser)
+    ensure_unsuspend_tracker_dock(browser, show=True)
+
+
+def ensure_unsuspend_tracker_dock(browser: Browser, show: bool) -> None:
+    dock = getattr(browser, DOCK_ATTRIBUTE, None)
+
+    if dock is not None and is_widget_alive(dock):
+        widget = dock.widget()
+        if isinstance(widget, UnsuspendTrackerWidget):
+            widget.update_view()
+        if show:
+            dock.show()
+            dock.raise_()
         return
 
     widget = UnsuspendTrackerWidget(browser)
@@ -324,6 +339,10 @@ def attach_unsuspend_tracker_widget(browser: Browser) -> None:
     dock.setWidget(widget)
     browser.addDockWidget(Qt.DockWidgetArea.RightDockWidgetArea, dock)
     setattr(browser, DOCK_ATTRIBUTE, dock)
+
+    if show:
+        dock.show()
+        dock.raise_()
 
 
 def ensure_default_scope_locked() -> None:
@@ -353,6 +372,21 @@ def refresh_tracker_widgets_after_delay() -> None:
     QTimer.singleShot(2000, refresh_tracker_widgets)
 
 
+def sync_tracker_baseline_to_current_scope() -> None:
+    if (
+        not unsuspend_tracker.is_tracking_enabled()
+        or unsuspend_tracker.get_locked_scope_query() is None
+    ):
+        refresh_tracker_widget_views()
+        return
+
+    scope_query = unsuspend_tracker.get_locked_scope_query() or ""
+    current_suspended_cids = find_suspended_cids_in_scope(scope_query)
+    unsuspend_tracker.sync_baseline_without_capturing(current_suspended_cids)
+    save_tracker_state()
+    refresh_tracker_widget_views()
+
+
 def refresh_tracker_widgets() -> None:
     for widget in list(_widgets):
         if not is_widget_alive(widget):
@@ -360,6 +394,15 @@ def refresh_tracker_widgets() -> None:
             continue
 
         widget.refresh(show_errors=False)
+
+
+def refresh_tracker_widget_views() -> None:
+    for widget in list(_widgets):
+        if not is_widget_alive(widget):
+            unregister_tracker_widget(widget)
+            continue
+
+        widget.update_view()
 
 
 def unregister_tracker_widget(widget: "UnsuspendTrackerWidget") -> None:
@@ -454,6 +497,16 @@ def default_share_tag_for_window(window: FreshnessWindow) -> str:
         return f"share_unsuspended::week_{week_start.isoformat().replace('-', '_')}"
 
     return f"share_unsuspended::{now.date().isoformat().replace('-', '_')}"
+
+
+def default_ankipatch_filename(window: FreshnessWindow) -> str:
+    now = datetime.now()
+
+    if window == FreshnessWindow.THIS_WEEK:
+        week_start = unsuspend_tracker.start_of_week(now).date()
+        return f"fresh_unsuspends_week_{week_start.isoformat()}.ankipatch"
+
+    return f"fresh_unsuspends_{now.date().isoformat()}.ankipatch"
 
 
 def save_tracker_state() -> None:

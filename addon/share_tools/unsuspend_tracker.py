@@ -81,6 +81,16 @@ def record_snapshot(
     return new_events
 
 
+def sync_baseline_without_capturing(current_suspended_cids: Iterable[int]) -> None:
+    if not _tracking_enabled or _locked_scope_query is None:
+        return
+
+    current_suspended = {int(cid) for cid in current_suspended_cids}
+    remove_captured_cids(current_suspended)
+    _previous_suspended_cids.clear()
+    _previous_suspended_cids.update(current_suspended)
+
+
 def get_captured_events() -> list[UnsuspendEvent]:
     return sorted(
         _captured_events_by_cid.values(),
