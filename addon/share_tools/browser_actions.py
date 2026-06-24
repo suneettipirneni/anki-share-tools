@@ -9,6 +9,7 @@ from aqt.qt import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QMenu,
@@ -336,7 +337,7 @@ def build_resolved_cards_table(
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row_index, column_index, item)
 
-    table.resizeColumnsToContents()
+    configure_table_to_fit_width(table)
     return table
 
 
@@ -396,8 +397,14 @@ def build_unresolved_rows_table(
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row_index, column_index, item)
 
-    table.resizeColumnsToContents()
+    configure_table_to_fit_width(table)
     return table
+
+
+def configure_table_to_fit_width(table: QTableWidget) -> None:
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
 
 def suspended_state_label(suspended: Optional[bool]) -> str:
