@@ -306,6 +306,7 @@ def build_resolved_cards_table(
         "Card Type",
         "Deck",
         "Due",
+        "Patch Tags",
         "Previous State",
         "Target State",
         "Result",
@@ -313,7 +314,12 @@ def build_resolved_cards_table(
     ]
     rows = sorted(
         (resolved_card_result_values(result) for result in results),
-        key=lambda values: (values[0].lower(), values[1].lower(), values[2].lower(), values[3]),
+        key=lambda values: (
+            values[0].lower(),
+            values[1].lower(),
+            values[2].lower(),
+            values[3],
+        ),
     )
     table = QTableWidget(len(rows), len(headers), parent)
     table.setHorizontalHeaderLabels(headers)
@@ -346,6 +352,7 @@ def resolved_card_result_values(result: PatchApplyResult) -> list[str]:
         get_card_type_name(card),
         get_deck_name(card),
         get_due_text(card),
+        ", ".join(result.row.tags),
         suspended_state_label(result.previous_suspended),
         "Suspended" if result.row.suspended else "Unsuspended",
         result_status_label(result),
@@ -360,6 +367,7 @@ def build_unresolved_rows_table(
     headers = [
         "Patch Note GUID",
         "Patch Card Ord",
+        "Patch Tags",
         "Target State",
         "Result",
         "Details",
@@ -377,6 +385,7 @@ def build_unresolved_rows_table(
         values = [
             result.row.note_guid,
             str(result.row.card_ord),
+            ", ".join(result.row.tags),
             "Suspended" if result.row.suspended else "Unsuspended",
             result_status_label(result),
             result.message,

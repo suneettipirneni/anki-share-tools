@@ -1,4 +1,5 @@
 import pytest
+from typing import Optional
 
 from share_tools.ankipatch import (
     AnkiPatch,
@@ -12,9 +13,10 @@ from share_tools.ankipatch import (
 
 
 class FakeNote:
-    def __init__(self, note_id: int, guid: str) -> None:
+    def __init__(self, note_id: int, guid: str, tags: Optional[list[str]] = None) -> None:
         self.id = note_id
         self.guid = guid
+        self.tags = tags or []
 
 
 class FakeCard:
@@ -70,8 +72,8 @@ class FakeScheduler:
 class FakeCollection:
     def __init__(self) -> None:
         self.notes = {
-            10: FakeNote(10, "guid-a"),
-            20: FakeNote(20, "guid-b"),
+            10: FakeNote(10, "guid-a", ["class::alpha", "source::peer"]),
+            20: FakeNote(20, "guid-b", ["class::beta"]),
         }
         self.cards = {
             100: FakeCard(100, 10, 0, -1),
@@ -96,7 +98,7 @@ def test_serialize_and_parse_patch_round_trips_rows() -> None:
     patch = AnkiPatch(
         cards=[
             CardPatchRow("guid-b", 1, True),
-            CardPatchRow("guid-a", 0, False),
+            CardPatchRow("guid-a", 0, False, ("class::alpha",)),
         ],
         created_at="2026-06-23T12:00:00+00:00",
     )
@@ -105,7 +107,7 @@ def test_serialize_and_parse_patch_round_trips_rows() -> None:
 
     assert parsed == AnkiPatch(
         cards=[
-            CardPatchRow("guid-a", 0, False),
+            CardPatchRow("guid-a", 0, False, ("class::alpha",)),
             CardPatchRow("guid-b", 1, True),
         ],
         created_at="2026-06-23T12:00:00+00:00",
@@ -132,8 +134,31 @@ def test_card_rows_from_card_ids_uses_note_guid_ord_and_suspended_state() -> Non
     col = FakeCollection()
 
     assert card_rows_from_card_ids(col, [101, 100, 100]) == [
-        CardPatchRow("guid-a", 0, True),
-        CardPatchRow("guid-a", 1, False),
+        CardPatchRow("guid-a", 0, True, ("class::alpha", "source::peer")),
+        CardPatchRow("guid-a", 1, False, ("class::alpha", "source::peer")),
+    ]
+
+
+def test_parse_patch_accepts_tags_when_present() -> None:
+    text = """
+    {
+      "format": "anki-share-tools/ankipatch",
+      "version": 1,
+      "cards": [
+        {
+          "note_guid": "guid-a",
+          "card_ord": 0,
+          "suspended": true,
+          "tags": ["class::alpha", "source::peer"]
+        }
+      ]
+    }
+    """
+
+    parsed = parse_patch_text(text)
+
+    assert parsed.cards == [
+        CardPatchRow("guid-a", 0, True, ("class::alpha", "source::peer"))
     ]
 
 
@@ -172,7 +197,7 @@ def test_apply_report_splits_successful_and_unsuccessful_results() -> None:
             AnkiPatch(
                 cards=[
                     CardPatchRow("guid-a", 0, False),
-                    CardPatchRow("guid-missing", 0, True),
+                    CardPatchRow("guid-missing", 0, True, ("class::alpha",)),
                 ]
             ),
         )
@@ -184,3 +209,4 @@ def test_apply_report_splits_successful_and_unsuccessful_results() -> None:
     assert "Successful" in report
     assert "Unsuccessful" in report
     assert "guid-missing" in report
+    assert "tags=[class::alpha]" in report
