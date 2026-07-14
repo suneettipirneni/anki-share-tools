@@ -22,10 +22,12 @@ from aqt.utils import showInfo, tooltip
 
 from .ankipatch import (
     AnkiPatch,
+    CardPatchRow,
     PatchApplyResult,
     apply_patch_to_collection,
     card_rows_from_card_ids,
     ensure_ankipatch_suffix,
+    preview_patch_against_collection,
     read_patch,
     write_patch,
 )
@@ -237,10 +239,150 @@ def apply_ankipatch_from_file(parent: Any) -> None:
         showInfo("Ankipatch contains no cards.")
         return
 
-    results = apply_patch_to_collection(mw.col, patch)
+    preview_results = preview_patch_against_collection(mw.col, patch)
+    selected_rows = show_ankipatch_preview_dialog(parent, preview_results)
+
+    if selected_rows is None:
+        return
+
+    if not selected_rows:
+        return
+
+    selected_patch = AnkiPatch(cards=selected_rows, created_at=patch.created_at)
+    results = apply_patch_to_collection(mw.col, selected_patch)
     sync_tracker_baseline_to_current_scope()
     maybe_reset_main_window()
     show_ankipatch_results_dialog(parent, results)
+
+
+def show_ankipatch_preview_dialog(
+    parent: Any,
+    results: list[PatchApplyResult],
+) -> Optional[list[CardPatchRow]]:
+    preview_rows = sorted(
+        (result for result in results if result.status in {"pending", "unchanged"}),
+        key=lambda result: tuple(
+            value.lower() for value in resolved_card_preview_values(result)[:3]
+        ),
+    )
+    change_count = sum(1 for result in preview_rows if result.status == "pending")
+    unchanged_count = len(preview_rows) - change_count
+    unavailable_count = len(results) - len(preview_rows)
+
+    if not preview_rows:
+        details = ["No patch cards could be shown."]
+        if unavailable_count:
+            details.append(
+                f"{unavailable_count} patch row(s) could not be resolved and were ignored."
+            )
+        showInfo("\n\n".join(details))
+        return None
+
+    dialog = QDialog(parent)
+    dialog.setWindowTitle("Review ankipatch changes")
+    dialog.resize(980, 620)
+
+    layout = QVBoxLayout(dialog)
+    summary_parts = [f"{change_count} card change(s) ready to apply."]
+    if unchanged_count:
+        summary_parts.append(
+            f"{unchanged_count} already matched and cannot be selected."
+        )
+    if unavailable_count:
+        summary_parts.append(
+            f"{unavailable_count} could not be resolved and will be ignored."
+        )
+    summary = QLabel(" ".join(summary_parts), dialog)
+    summary.setWordWrap(True)
+    layout.addWidget(summary)
+
+    headers = [
+        "Apply",
+        "Sort Field",
+        "Card Type",
+        "Deck",
+        "Due",
+        "Current State",
+        "Target State",
+        "Status",
+    ]
+    table = QTableWidget(len(preview_rows), len(headers), dialog)
+    table.setHorizontalHeaderLabels(headers)
+    table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
+    table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
+    table.setAlternatingRowColors(True)
+    table.verticalHeader().setVisible(False)
+    table.horizontalHeader().setStretchLastSection(True)
+
+    for row_index, result in enumerate(preview_rows):
+        is_change = result.status == "pending"
+        apply_item = QTableWidgetItem()
+        apply_flags = (
+            apply_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
+        ) & ~Qt.ItemFlag.ItemIsEditable
+        if not is_change:
+            apply_flags &= ~Qt.ItemFlag.ItemIsEnabled
+        apply_item.setFlags(apply_flags)
+        apply_item.setCheckState(
+            Qt.CheckState.Checked if is_change else Qt.CheckState.Unchecked
+        )
+        table.setItem(row_index, 0, apply_item)
+
+        values = [
+            *resolved_card_preview_values(result),
+            "Will change" if is_change else "Same state",
+        ]
+        for column_index, value in enumerate(
+            values,
+            start=1,
+        ):
+            item = QTableWidgetItem(value)
+            item_flags = item.flags() & ~Qt.ItemFlag.ItemIsEditable
+            if not is_change:
+                item_flags &= ~Qt.ItemFlag.ItemIsEnabled
+            item.setFlags(item_flags)
+            table.setItem(row_index, column_index, item)
+
+    table.resizeColumnsToContents()
+    layout.addWidget(table)
+
+    buttons = QDialogButtonBox(QDialogButtonBox.StandardButton.Cancel, dialog)
+    apply_button = buttons.addButton(
+        "Apply selected" if change_count else "Close",
+        QDialogButtonBox.ButtonRole.AcceptRole,
+    )
+    apply_button.clicked.connect(dialog.accept)
+    cancel_button = buttons.button(QDialogButtonBox.StandardButton.Cancel)
+    if cancel_button is not None:
+        cancel_button.clicked.connect(dialog.reject)
+    layout.addWidget(buttons)
+
+    if dialog.exec() != QDialog.DialogCode.Accepted:
+        return None
+
+    return [
+        result.row
+        for row_index, result in enumerate(preview_rows)
+        if result.status == "pending"
+        and table.item(row_index, 0).checkState() == Qt.CheckState.Checked
+    ]
+
+
+def resolved_card_preview_values(result: PatchApplyResult) -> list[str]:
+    card = get_result_card(result)
+    note_id = result.note_id
+
+    if card is not None:
+        note_id = int(card.nid)
+
+    return [
+        get_note_sort_field(note_id),
+        get_card_type_name(card),
+        get_deck_name(card),
+        get_due_text(card),
+        suspended_state_label(result.previous_suspended),
+        "Suspended" if result.row.suspended else "Unsuspended",
+    ]
 
 
 def show_ankipatch_results_dialog(
@@ -313,7 +455,12 @@ def build_resolved_cards_table(
     ]
     rows = sorted(
         (resolved_card_result_values(result) for result in results),
-        key=lambda values: (values[0].lower(), values[1].lower(), values[2].lower(), values[3]),
+        key=lambda values: (
+            values[0].lower(),
+            values[1].lower(),
+            values[2].lower(),
+            values[3],
+        ),
     )
     table = QTableWidget(len(rows), len(headers), parent)
     table.setHorizontalHeaderLabels(headers)

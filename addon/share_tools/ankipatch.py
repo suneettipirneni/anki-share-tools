@@ -76,16 +76,16 @@ def parse_patch_text(text: str) -> AnkiPatch:
         raise ValueError(f"Invalid ankipatch format: expected {FORMAT_NAME}.")
 
     if payload.get("version") != FORMAT_VERSION:
-        raise ValueError(
-            f"Unsupported ankipatch version: {payload.get('version')!r}."
-        )
+        raise ValueError(f"Unsupported ankipatch version: {payload.get('version')!r}.")
 
     raw_cards = payload.get("cards")
     if not isinstance(raw_cards, list):
         raise ValueError("Invalid ankipatch: cards must be a list.")
 
     rows = [parse_card_row(raw_card, index) for index, raw_card in enumerate(raw_cards)]
-    return AnkiPatch(cards=normalize_rows(rows), created_at=optional_str(payload, "created_at"))
+    return AnkiPatch(
+        cards=normalize_rows(rows), created_at=optional_str(payload, "created_at")
+    )
 
 
 def read_patch(path: Path) -> AnkiPatch:
@@ -130,6 +130,66 @@ def resolve_card_id(col: Any, row: CardPatchRow) -> Optional[int]:
         return None
 
     return int(card_id)
+
+
+def preview_patch_against_collection(
+    col: Any,
+    patch: AnkiPatch,
+) -> list[PatchApplyResult]:
+    results: list[PatchApplyResult] = []
+
+    for row in patch.cards:
+        card_id = resolve_card_id(col, row)
+
+        if card_id is None:
+            results.append(
+                PatchApplyResult(
+                    row=row,
+                    card_id=None,
+                    status="missing",
+                    message="Card not found in this collection.",
+                )
+            )
+            continue
+
+        note_id: Optional[int] = None
+        currently_suspended: Optional[bool] = None
+
+        try:
+            card = col.get_card(card_id)
+            currently_suspended = int(card.queue) == SUSPENDED_QUEUE
+            note_id = int(card.nid)
+
+            if currently_suspended == row.suspended:
+                status = "unchanged"
+                message = "Already matched patch state."
+            else:
+                status = "pending"
+                message = "Ready to apply."
+
+            results.append(
+                PatchApplyResult(
+                    row=row,
+                    card_id=card_id,
+                    status=status,
+                    message=message,
+                    note_id=note_id,
+                    previous_suspended=currently_suspended,
+                )
+            )
+        except Exception as exc:
+            results.append(
+                PatchApplyResult(
+                    row=row,
+                    card_id=card_id,
+                    status="error",
+                    message=str(exc),
+                    note_id=note_id,
+                    previous_suspended=currently_suspended,
+                )
+            )
+
+    return results
 
 
 def apply_patch_to_collection(col: Any, patch: AnkiPatch) -> list[PatchApplyResult]:
@@ -177,9 +237,7 @@ def apply_patch_to_collection(col: Any, patch: AnkiPatch) -> list[PatchApplyResu
                     card_id=card_id,
                     status="updated",
                     message=(
-                        "Suspended card."
-                        if row.suspended
-                        else "Unsuspended card."
+                        "Suspended card." if row.suspended else "Unsuspended card."
                     ),
                     note_id=note_id,
                     previous_suspended=currently_suspended,
@@ -285,7 +343,9 @@ def parse_card_row(raw_card: Any, index: int) -> CardPatchRow:
         )
 
     if not isinstance(suspended, bool):
-        raise ValueError(f"Invalid card row at index {index}: suspended must be true or false.")
+        raise ValueError(
+            f"Invalid card row at index {index}: suspended must be true or false."
+        )
 
     return CardPatchRow(
         note_guid=note_guid.strip(),

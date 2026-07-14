@@ -7,6 +7,7 @@ from share_tools.ankipatch import (
     card_rows_from_card_ids,
     format_apply_report,
     parse_patch_text,
+    preview_patch_against_collection,
     serialize_patch,
 )
 
@@ -163,6 +164,30 @@ def test_apply_patch_updates_by_note_guid_and_card_ord() -> None:
         (None, None),
     ]
     assert [result.previous_suspended for result in results] == [True, False, None]
+
+
+def test_preview_patch_identifies_only_cards_that_need_changes() -> None:
+    col = FakeCollection()
+    patch = AnkiPatch(
+        cards=[
+            CardPatchRow("guid-a", 0, False),
+            CardPatchRow("guid-a", 1, False),
+            CardPatchRow("guid-missing", 0, True),
+        ]
+    )
+
+    results = preview_patch_against_collection(col, patch)
+
+    assert [result.status for result in results] == [
+        "pending",
+        "unchanged",
+        "missing",
+    ]
+    assert [result.row for result in results if result.status == "pending"] == [
+        CardPatchRow("guid-a", 0, False)
+    ]
+    assert col.cards[100].queue == -1
+    assert not col.saved
 
 
 def test_apply_report_splits_successful_and_unsuccessful_results() -> None:

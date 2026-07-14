@@ -32,14 +32,14 @@ The Browser panel lets you:
 - Keep captured unsuspensions across Anki restarts.
 - Switch between Today and This week freshness windows.
 - Export fresh unsuspensions as a portable `.ankipatch`.
-- Apply a received `.ankipatch` and review per-card results.
+- Review pending card changes, choose which ones to apply, and inspect per-card results.
 
 It exposes these actions under the Share Tools menu:
 
 - Show fresh cards panel: reopens the Browser side panel if it was hidden.
 - Export selected cards as ankipatch: saves selected cards with portable note GUID, card ordinal, and suspended/unsuspended state.
 - Export current unsuspended class subset as ankipatch: infers the selected `class::` tag and exports matching unsuspended cards.
-- Apply ankipatch: resolves each patch row against the local collection and reports successful and unsuccessful applications.
+- Apply ankipatch: previews only cards whose state would change, lets you choose which changes to apply, and reports successful and unsuccessful applications.
 
 You can also apply an `.ankipatch` from Anki's Tools menu.
 
