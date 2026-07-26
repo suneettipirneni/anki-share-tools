@@ -1,9 +1,19 @@
 from datetime import date, datetime
 import json
+from pathlib import Path
 import sqlite3
+from types import SimpleNamespace
+from typing import Optional
 
 import pytest
+from anki.errors import NotFoundError
 
+from share_tools import browser_widget
+from share_tools.tracker_database import (
+    StoredTrackerState,
+    TrackerDatabase,
+    TrackerMigrationError,
+)
 from share_tools.unsuspend_tracker import (
     DateRange,
     FreshnessWindow,
@@ -13,6 +23,7 @@ from share_tools.unsuspend_tracker import (
     count_for_window,
     count_for_date_range,
     date_range_for_window,
+    decode_legacy_tracker_state,
     get_captured_cids_for_window,
     get_captured_cids_for_date_range,
     get_captured_events,
@@ -46,6 +57,52 @@ def cid_to_nid(cid: int) -> int:
     return cid // 10
 
 
+def legacy_tracker_payload() -> dict[str, object]:
+    return {
+        "version": 1,
+        "tracking_enabled": True,
+        "locked_scope_query": "tag:class::cardiology",
+        "previous_suspended_cids": [20],
+        "captured_events": [
+            {
+                "cid": 10,
+                "nid": 1,
+                "detected_at": "2026-06-15T12:00:00",
+                "scope_query": "tag:class::cardiology",
+            }
+        ],
+    }
+
+
+def test_browser_card_resolver_returns_none_only_for_missing_cards(
+    monkeypatch,
+) -> None:
+    def missing_card(_cid: int) -> None:
+        raise NotFoundError("missing", None, None, None)
+
+    monkeypatch.setattr(
+        browser_widget,
+        "mw",
+        SimpleNamespace(col=SimpleNamespace(get_card=missing_card)),
+    )
+
+    assert browser_widget.cid_to_nid(10) is None
+
+
+def test_browser_card_resolver_propagates_unexpected_errors(monkeypatch) -> None:
+    def broken_card_lookup(_cid: int) -> None:
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(
+        browser_widget,
+        "mw",
+        SimpleNamespace(col=SimpleNamespace(get_card=broken_card_lookup)),
+    )
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        browser_widget.cid_to_nid(10)
+
+
 def test_lock_scope_stores_baseline_enables_tracking_and_clears_events() -> None:
     lock_scope("tag:old", [10])
     record_snapshot([], cid_to_nid, now=datetime(2026, 6, 15, 9))
@@ -70,6 +127,186 @@ def test_record_snapshot_captures_cards_removed_from_suspended_set() -> None:
             detected_at=now,
             scope_query="tag:class::cardiology",
         )
+    ]
+
+
+def test_deleted_baseline_card_is_pruned_without_creating_event() -> None:
+    resolver_calls: list[int] = []
+
+    def resolve_missing_card(cid: int) -> None:
+        resolver_calls.append(cid)
+        return None
+
+    lock_scope("tag:class::cardiology", [10])
+
+    assert record_snapshot([], resolve_missing_card) == []
+    assert record_snapshot([], resolve_missing_card) == []
+    assert resolver_calls == [10]
+    assert get_captured_events() == []
+
+
+def test_deleted_and_valid_departures_are_partitioned_in_one_snapshot() -> None:
+    def resolve_card(cid: int) -> Optional[int]:
+        return None if cid == 10 else cid // 10
+
+    now = datetime(2026, 6, 15, 10)
+    lock_scope("tag:class::cardiology", [10, 20])
+
+    assert record_snapshot([], resolve_card, now=now) == [
+        UnsuspendEvent(
+            cid=20,
+            nid=2,
+            detected_at=now,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+    assert get_captured_events() == [
+        UnsuspendEvent(
+            cid=20,
+            nid=2,
+            detected_at=now,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+
+
+def test_deleted_baseline_card_is_not_retried_after_restart(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    initialize_storage(database_path)
+    lock_scope("tag:class::cardiology", [10])
+
+    assert record_snapshot([], lambda _cid: None) == []
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path)
+
+    def unexpected_resolver_call(_cid: int) -> None:
+        raise AssertionError("deleted card was retried")
+
+    assert record_snapshot([], unexpected_resolver_call) == []
+
+
+def test_resolver_failure_does_not_partially_advance_snapshot(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    now = datetime(2026, 6, 15, 10)
+    initialize_storage(database_path)
+    lock_scope("tag:class::cardiology", [10, 20])
+
+    def fail_after_first_resolution(cid: int) -> int:
+        if cid == 20:
+            raise RuntimeError("backend unavailable")
+        return cid // 10
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        record_snapshot([], fail_after_first_resolution, now=now)
+
+    assert get_captured_events() == []
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path)
+    assert record_snapshot([], cid_to_nid, now=now) == [
+        UnsuspendEvent(10, 1, now, "tag:class::cardiology"),
+        UnsuspendEvent(20, 2, now, "tag:class::cardiology"),
+    ]
+
+
+def test_snapshot_classifies_suspension_scope_and_entry_independently() -> None:
+    now = datetime(2026, 6, 15, 10)
+    resolved_cids: list[int] = []
+
+    def resolve_card(cid: int) -> int:
+        resolved_cids.append(cid)
+        return cid // 10
+
+    lock_scope("tag:class::cardiology", [10, 20, 30])
+
+    assert record_snapshot(
+        current_in_scope_cids=[10, 20, 40],
+        current_suspended_cids=[10, 40],
+        cid_to_nid=resolve_card,
+        now=now,
+    ) == [
+        UnsuspendEvent(
+            cid=20,
+            nid=2,
+            detected_at=now,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+    assert resolved_cids == [20]
+
+    assert record_snapshot(
+        current_in_scope_cids=[10, 40],
+        current_suspended_cids=[10, 40],
+        cid_to_nid=resolve_card,
+        now=now,
+    ) == []
+    assert resolved_cids == [20]
+
+    later = datetime(2026, 6, 15, 11)
+    assert record_snapshot(
+        current_in_scope_cids=[10, 40],
+        current_suspended_cids=[40],
+        cid_to_nid=resolve_card,
+        now=later,
+    ) == [
+        UnsuspendEvent(
+            cid=10,
+            nid=1,
+            detected_at=later,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+    assert [event.cid for event in get_captured_events()] == [20, 10]
+
+
+def test_scope_departure_with_missing_card_is_pruned_without_resolution() -> None:
+    lock_scope("tag:class::cardiology", [10])
+
+    def unexpected_resolver_call(_cid: int) -> None:
+        raise AssertionError("out-of-scope card should not be resolved")
+
+    assert record_snapshot(
+        current_in_scope_cids=[],
+        current_suspended_cids=[],
+        cid_to_nid=unexpected_resolver_call,
+    ) == []
+
+
+def test_snapshot_database_failure_leaves_runtime_baseline_unchanged(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    initialize_storage(database_path)
+    lock_scope("tag:class::cardiology", [10, 20])
+
+    def fail_snapshot(*_args, **_kwargs) -> None:
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(
+        "share_tools.unsuspend_tracker._database.apply_snapshot",
+        fail_snapshot,
+    )
+
+    with pytest.raises(OSError, match="database unavailable"):
+        record_snapshot(
+            current_in_scope_cids=[10, 20],
+            current_suspended_cids=[20],
+            cid_to_nid=cid_to_nid,
+        )
+
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path)
+    now = datetime(2026, 6, 15, 10)
+    assert record_snapshot(
+        current_in_scope_cids=[10, 20],
+        current_suspended_cids=[20],
+        cid_to_nid=cid_to_nid,
+        now=now,
+    ) == [
+        UnsuspendEvent(10, 1, now, "tag:class::cardiology")
     ]
 
 
@@ -391,25 +628,8 @@ def test_initialized_storage_persists_mutations_automatically(tmp_path) -> None:
 def test_initialize_storage_migrates_legacy_json_state(tmp_path) -> None:
     database_path = tmp_path / "tracker.sqlite3"
     legacy_path = tmp_path / "tracker.json"
-    legacy_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "tracking_enabled": True,
-                "locked_scope_query": "tag:class::cardiology",
-                "previous_suspended_cids": [20],
-                "captured_events": [
-                    {
-                        "cid": 10,
-                        "nid": 1,
-                        "detected_at": "2026-06-15T12:00:00",
-                        "scope_query": "tag:class::cardiology",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
 
     initialize_storage(
         database_path,
@@ -433,6 +653,299 @@ def test_initialize_storage_migrates_legacy_json_state(tmp_path) -> None:
             scope_query="tag:class::cardiology",
         )
     ]
+    assert get_retention_days() == 30
+    assert legacy_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"previous_suspended_cids": [], "captured_events": "invalid"},
+        {
+            "previous_suspended_cids": ["10"],
+            "captured_events": [],
+        },
+        {
+            "previous_suspended_cids": [10, 10],
+            "captured_events": [],
+        },
+        {
+            "previous_suspended_cids": [10],
+            "captured_events": [
+                {
+                    "cid": 10,
+                    "nid": 1,
+                    "detected_at": "2026-06-15T12:00:00",
+                    "scope_query": "deck:current",
+                }
+            ],
+        },
+        {
+            "previous_suspended_cids": [],
+            "captured_events": [
+                {
+                    "cid": 10,
+                    "nid": 1,
+                    "detected_at": "not-a-timestamp",
+                    "scope_query": "deck:current",
+                }
+            ],
+        },
+        {
+            "previous_suspended_cids": [],
+            "captured_events": [],
+            "retention_days": -1,
+        },
+        {
+            "previous_suspended_cids": [],
+            "captured_events": [],
+            "retention_days": True,
+        },
+    ],
+)
+def test_legacy_decoder_rejects_invalid_payloads(payload) -> None:
+    with pytest.raises(ValueError):
+        decode_legacy_tracker_state(payload)
+
+
+def test_legacy_decoder_defaults_missing_retention_to_thirty_days() -> None:
+    state = decode_legacy_tracker_state(legacy_tracker_payload())
+
+    assert state.retention_days == 30
+
+
+def test_malformed_legacy_json_raises_typed_error_without_source_contents(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    secret_contents = '{"private-token":"do-not-echo"'
+    legacy_path.write_text(secret_contents, encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+
+    with pytest.raises(TrackerMigrationError) as error:
+        initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "invalid-payload"
+    assert error.value.source_path == legacy_path
+    assert error.value.destination_path == database_path
+    assert secret_contents not in str(error.value)
+    assert legacy_path.read_bytes() == original_bytes
+    assert not database_path.exists()
+
+
+def test_legacy_source_read_failure_is_typed_and_retryable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+    real_read_text = Path.read_text
+
+    def fail_legacy_read(path: Path, *args, **kwargs) -> str:
+        if path == legacy_path:
+            raise OSError("simulated source failure")
+        return real_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(Path, "read_text", fail_legacy_read)
+        with pytest.raises(TrackerMigrationError) as error:
+            initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "source-read"
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
+
+    initialize_storage(database_path, legacy_path)
+    assert get_locked_scope_query() == "tag:class::cardiology"
+
+
+def test_legacy_destination_write_failure_is_retryable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+
+    def fail_save(
+        _database: TrackerDatabase,
+        _state: StoredTrackerState,
+    ) -> None:
+        raise OSError("simulated write failure")
+
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(TrackerDatabase, "save", fail_save)
+        with pytest.raises(TrackerMigrationError) as error:
+            initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "destination-write"
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
+
+    initialize_storage(database_path, legacy_path)
+    assert get_locked_scope_query() == "tag:class::cardiology"
+
+
+def test_legacy_destination_readback_mismatch_is_retryable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+    real_load = TrackerDatabase.load
+    load_count = 0
+
+    def mismatch_on_readback(database: TrackerDatabase):
+        nonlocal load_count
+        load_count += 1
+        state = real_load(database)
+        if load_count == 2:
+            return StoredTrackerState(None, (), (), 30)
+        return state
+
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(TrackerDatabase, "load", mismatch_on_readback)
+        with pytest.raises(TrackerMigrationError) as error:
+            initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "verification"
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
+
+    initialize_storage(database_path, legacy_path)
+    assert get_locked_scope_query() == "tag:class::cardiology"
+
+
+def test_failed_migration_quarantines_preexisting_empty_destination(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    TrackerDatabase(database_path).load()
+    legacy_path.write_text("invalid json", encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+
+    with pytest.raises(TrackerMigrationError) as error:
+        initialize_storage(database_path, legacy_path)
+
+    assert error.value.quarantine_path is not None
+    assert error.value.quarantine_path.exists()
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
+
+
+def configure_browser_tracker_storage(monkeypatch, tmp_path: Path) -> None:
+    user_files_dir = tmp_path / "user_files"
+    monkeypatch.setattr(browser_widget, "USER_FILES_DIR", user_files_dir)
+    monkeypatch.setattr(
+        browser_widget,
+        "LEGACY_DATABASE_FILE",
+        user_files_dir / "fresh_card_state.sqlite3",
+    )
+    monkeypatch.setattr(
+        browser_widget,
+        "LEGACY_STATE_FILE",
+        tmp_path / "unsuspend_tracker_state.json",
+    )
+    monkeypatch.setattr(
+        browser_widget,
+        "LEGACY_CLAIM_MARKER",
+        user_files_dir / "profiles" / ".legacy-state-claimed",
+    )
+
+
+def test_profile_storage_failure_is_contained_and_not_retried_on_attach(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    browser_widget.deactivate_tracker_profile()
+    configure_browser_tracker_storage(monkeypatch, tmp_path)
+    profile_path = tmp_path / "Profile A" / "collection.anki2"
+    profile_key = browser_widget.profile_key_for_collection_path(profile_path)
+    database_path = browser_widget.profile_database_path(profile_key)
+    database_path.parent.mkdir(parents=True)
+    database_path.write_bytes(b"not a sqlite database")
+    notifications: list[str] = []
+    monkeypatch.setattr(browser_widget, "showInfo", notifications.append)
+
+    browser_widget.activate_tracker_profile(profile_path)
+
+    assert not browser_widget.is_tracker_storage_healthy()
+    assert not is_tracking_enabled()
+    assert get_locked_scope_query() is None
+    assert len(notifications) == 1
+
+    browser_widget.activate_tracker_profile(profile_path)
+    assert len(notifications) == 1
+    assert database_path.read_bytes() == b"not a sqlite database"
+
+    browser_widget.deactivate_tracker_profile()
+    browser_widget.activate_tracker_profile(profile_path)
+    assert len(notifications) == 2
+    browser_widget.deactivate_tracker_profile()
+
+
+def test_start_fresh_requires_confirmation_and_backs_up_failed_database(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    browser_widget.deactivate_tracker_profile()
+    configure_browser_tracker_storage(monkeypatch, tmp_path)
+    profile_path = tmp_path / "Profile A" / "collection.anki2"
+    monkeypatch.setattr(
+        browser_widget,
+        "mw",
+        SimpleNamespace(col=SimpleNamespace(path=str(profile_path))),
+    )
+    monkeypatch.setattr(browser_widget, "showInfo", lambda _message: None)
+    profile_key = browser_widget.profile_key_for_collection_path(profile_path)
+    database_path = browser_widget.profile_database_path(profile_key)
+    database_path.parent.mkdir(parents=True)
+    failed_contents = b"failed database bytes"
+    database_path.write_bytes(failed_contents)
+    browser_widget.activate_tracker_profile(profile_path)
+    now = datetime(2026, 7, 26, 12, 30)
+
+    assert browser_widget.start_fresh_tracker_storage(False, now) is None
+    assert database_path.read_bytes() == failed_contents
+
+    backup_path = browser_widget.start_fresh_tracker_storage(True, now)
+
+    assert backup_path is not None
+    assert backup_path.name.endswith(".failed-20260726-123000")
+    assert backup_path.read_bytes() == failed_contents
+    assert browser_widget.is_tracker_storage_healthy()
+    assert TrackerDatabase(database_path).load() == StoredTrackerState(
+        None,
+        (),
+        (),
+        30,
+    )
+    browser_widget.deactivate_tracker_profile()
+
+
+def test_open_tracker_data_folder_uses_anki_helper(monkeypatch, tmp_path) -> None:
+    browser_widget.deactivate_tracker_profile()
+    configure_browser_tracker_storage(monkeypatch, tmp_path)
+    profile_path = tmp_path / "Profile A" / "collection.anki2"
+    opened_paths: list[str] = []
+    monkeypatch.setattr(browser_widget, "openFolder", opened_paths.append)
+    browser_widget.activate_tracker_profile(profile_path)
+
+    browser_widget.open_tracker_data_folder()
+
+    database_path = browser_widget.profile_database_path(
+        browser_widget.profile_key_for_collection_path(profile_path)
+    )
+    assert opened_paths == [str(database_path.parent)]
+    browser_widget.deactivate_tracker_profile()
 
 
 def test_retention_setting_and_sweep_persist_across_restarts(tmp_path) -> None:

@@ -1,4 +1,5 @@
 {
   "name": "Share Tools",
-  "package": "share_tools"
+  "package": "share_tools",
+  "min_point_version": 50
 }

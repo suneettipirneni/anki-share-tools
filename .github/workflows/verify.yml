@@ -1,0 +1,97 @@
+name: Verify
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  verify:
+    name: ${{ matrix.name }}
+    runs-on: ubuntu-latest
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Current Anki 25.09.4 / Python 3.13
+            target: current
+            python-version: "3.13"
+          - name: Floor Anki 2.1.50 Qt6 / Python 3.9
+            target: floor
+            python-version: "3.9"
+
+    env:
+      DISABLE_QT5_COMPAT: "1"
+      PYTHONPATH: addon
+      QT_QPA_PLATFORM: offscreen
+      UV_PYTHON: ${{ matrix.python-version }}
+
+    steps:
+      - name: Check out repo
+        uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+
+      - name: Set up Python
+        run: uv python install ${{ matrix.python-version }}
+
+      - name: Sync current dependencies
+        if: matrix.target == 'current'
+        run: uv sync --locked --python ${{ matrix.python-version }}
+
+      - name: Lint
+        if: matrix.target == 'current'
+        run: uv run ruff check .
+
+      - name: Type check current target
+        if: matrix.target == 'current'
+        run: uv run pyright
+
+      - name: Test current target
+        if: matrix.target == 'current'
+        run: uv run pytest -q
+
+      - name: Type check floor target
+        if: matrix.target == 'floor'
+        run: >-
+          uv run --isolated --no-project --python 3.9
+          --with 'anki==2.1.50'
+          --with 'aqt[qt6]==2.1.50'
+          --with 'pyright>=1.1.407'
+          --with 'pytest>=8,<9'
+          pyright
+
+      - name: Test floor target
+        if: matrix.target == 'floor'
+        run: >-
+          uv run --isolated --no-project --python 3.9
+          --with 'anki==2.1.50'
+          --with 'aqt[qt6]==2.1.50'
+          --with 'pyright>=1.1.407'
+          --with 'pytest>=8,<9'
+          pytest -q
+
+      - name: Build archive
+        if: matrix.target == 'current'
+        run: uv run python scripts/build_ankiaddon.py
+
+      - name: Validate archive manifest with Anki
+        if: matrix.target == 'current'
+        run: >-
+          uv run python -c
+          'from zipfile import ZipFile;
+          from aqt.addons import AddonManager;
+          zf = ZipFile("dist/share_tools.ankiaddon");
+          manager = AddonManager.__new__(AddonManager);
+          manifest = manager.readManifestFile(zf);
+          assert manifest["min_point_version"] == 50, manifest'
