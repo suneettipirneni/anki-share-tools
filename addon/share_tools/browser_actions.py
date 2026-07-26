@@ -5,6 +5,7 @@ from typing import Any, Optional
 from anki.collection import OpChanges
 from aqt import gui_hooks, mw
 from aqt.browser import Browser
+from aqt.operations import CollectionOp
 from aqt.qt import (
     QAction,
     QAbstractItemView,
@@ -26,6 +27,7 @@ from .ankipatch import (
     AnkiPatch,
     CardPatchRow,
     PatchApplyResult,
+    PatchOperationResult,
     apply_patch_to_collection,
     card_rows_from_card_ids,
     ensure_ankipatch_suffix,
@@ -262,20 +264,38 @@ def apply_ankipatch_from_file(parent: Any) -> None:
     if decision is None:
         return
 
-    applied_results: list[PatchApplyResult] = []
+    if not decision.selected_rows:
+        final_results = combine_patch_apply_results([], decision)
+        if final_results:
+            show_ankipatch_results_dialog(parent, final_results)
+        return
 
-    if decision.selected_rows:
-        selected_patch = AnkiPatch(
-            cards=list(decision.selected_rows),
-            created_at=patch.created_at,
-        )
-        applied_results = apply_patch_to_collection(mw.col, selected_patch)
+    selected_patch = AnkiPatch(
+        cards=list(decision.selected_rows),
+        created_at=patch.created_at,
+    )
+
+    def on_success(operation_result: PatchOperationResult) -> None:
         sync_tracker_baseline_to_current_scope()
-        maybe_reset_main_window()
+        final_results = combine_patch_apply_results(
+            list(operation_result.results),
+            decision,
+        )
+        if final_results:
+            show_ankipatch_results_dialog(parent, final_results)
 
-    final_results = combine_patch_apply_results(applied_results, decision)
-    if final_results:
-        show_ankipatch_results_dialog(parent, final_results)
+    def on_failure(exc: Exception) -> None:
+        showInfo(f"Could not apply ankipatch:\n\n{exc}")
+
+    (
+        CollectionOp(
+            parent,
+            lambda col: apply_patch_to_collection(col, selected_patch),
+        )
+        .success(on_success)
+        .failure(on_failure)
+        .run_in_background()
+    )
 
 
 def build_patch_preview_ledger(
@@ -784,10 +804,3 @@ def choose_tags_if_needed(
 
 def debug_show(value: Any) -> None:
     showInfo(str(value))
-
-
-def maybe_reset_main_window() -> None:
-    reset = getattr(mw, "reset", None)
-
-    if callable(reset):
-        reset()

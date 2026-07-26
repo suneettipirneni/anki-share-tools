@@ -1,9 +1,14 @@
 from types import SimpleNamespace
-from typing import Optional
+from typing import Any, Callable, Optional
 
 from anki.collection import OpChanges
 from share_tools import browser_actions
-from share_tools.ankipatch import AnkiPatch, CardPatchRow, PatchApplyResult
+from share_tools.ankipatch import (
+    AnkiPatch,
+    CardPatchRow,
+    PatchApplyResult,
+    PatchOperationResult,
+)
 from share_tools.browser_actions import (
     PatchPreviewDecision,
     build_patch_preview_ledger,
@@ -27,6 +32,50 @@ def patch_result(
         status=status,
         message=f"{status} details",
     )
+
+
+class DeferredCollectionOp:
+    instances: list["DeferredCollectionOp"] = []
+
+    def __init__(
+        self,
+        parent: Any,
+        op: Callable[[Any], PatchOperationResult],
+    ) -> None:
+        self.parent = parent
+        self.op = op
+        self.success_callback: Optional[
+            Callable[[PatchOperationResult], None]
+        ] = None
+        self.failure_callback: Optional[Callable[[Exception], None]] = None
+        self.ran = False
+        self.instances.append(self)
+
+    def success(
+        self,
+        callback: Callable[[PatchOperationResult], None],
+    ) -> "DeferredCollectionOp":
+        self.success_callback = callback
+        return self
+
+    def failure(
+        self,
+        callback: Callable[[Exception], None],
+    ) -> "DeferredCollectionOp":
+        self.failure_callback = callback
+        return self
+
+    def run_in_background(self) -> None:
+        self.ran = True
+
+    def complete(self, collection: Any) -> None:
+        result = self.op(collection)
+        assert self.success_callback is not None
+        self.success_callback(result)
+
+    def fail(self, exc: Exception) -> None:
+        assert self.failure_callback is not None
+        self.failure_callback(exc)
 
 
 def test_card_operation_refreshes_tracker_after_completion(monkeypatch) -> None:
@@ -186,17 +235,20 @@ def test_apply_patch_cancel_does_not_mutate_collection(monkeypatch) -> None:
     assert apply_calls == 0
 
 
-def test_apply_patch_results_include_preview_only_missing_row(monkeypatch) -> None:
+def test_apply_patch_collection_op_syncs_before_hook_and_then_shows_results(
+    monkeypatch,
+) -> None:
     collection = object()
     pending = patch_result("guid-change", "pending", card_id=10)
     unchanged = patch_result("guid-same", "unchanged", card_id=20)
     missing = patch_result("guid-missing", "missing")
     updated = patch_result("guid-change", "updated", card_id=10)
     shown_results: list[PatchApplyResult] = []
-    sync_calls = 0
-    reset_calls = 0
+    events: list[str] = []
 
+    DeferredCollectionOp.instances.clear()
     monkeypatch.setattr(browser_actions, "mw", SimpleNamespace(col=collection))
+    monkeypatch.setattr(browser_actions, "CollectionOp", DeferredCollectionOp)
     monkeypatch.setattr(
         browser_actions.QFileDialog,
         "getOpenFileName",
@@ -225,32 +277,82 @@ def test_apply_patch_results_include_preview_only_missing_row(monkeypatch) -> No
     monkeypatch.setattr(
         browser_actions,
         "apply_patch_to_collection",
-        lambda _col, _patch: [updated],
+        lambda _col, _patch: PatchOperationResult(
+            changes=OpChanges(card=True, study_queues=True),
+            results=(updated,),
+        ),
     )
 
     def sync_tracker() -> None:
-        nonlocal sync_calls
-        sync_calls += 1
-
-    def reset_main_window() -> None:
-        nonlocal reset_calls
-        reset_calls += 1
+        events.append("sync")
 
     monkeypatch.setattr(
         browser_actions,
         "sync_tracker_baseline_to_current_scope",
         sync_tracker,
     )
-    monkeypatch.setattr(browser_actions, "maybe_reset_main_window", reset_main_window)
+    def show_results(_parent, results) -> None:
+        events.append("dialog")
+        shown_results.extend(results)
+
     monkeypatch.setattr(
         browser_actions,
         "show_ankipatch_results_dialog",
-        lambda _parent, results: shown_results.extend(results),
+        show_results,
     )
 
     browser_actions.apply_ankipatch_from_file(object())
 
+    assert len(DeferredCollectionOp.instances) == 1
+    operation = DeferredCollectionOp.instances[0]
+    assert operation.ran
+    assert events == []
+    assert shown_results == []
+
+    operation.complete(collection)
+    events.append("operation_did_execute")
+
     assert shown_results == [updated, missing]
     assert unchanged not in shown_results
-    assert sync_calls == 1
-    assert reset_calls == 1
+    assert events == ["sync", "dialog", "operation_did_execute"]
+
+
+def test_apply_patch_collection_op_failure_shows_actionable_error(monkeypatch) -> None:
+    collection = object()
+    pending = patch_result("guid-change", "pending", card_id=10)
+    messages: list[str] = []
+
+    DeferredCollectionOp.instances.clear()
+    monkeypatch.setattr(browser_actions, "mw", SimpleNamespace(col=collection))
+    monkeypatch.setattr(browser_actions, "CollectionOp", DeferredCollectionOp)
+    monkeypatch.setattr(
+        browser_actions.QFileDialog,
+        "getOpenFileName",
+        lambda *_args: ("cards.ankipatch", ""),
+    )
+    monkeypatch.setattr(
+        browser_actions,
+        "read_patch",
+        lambda _path: AnkiPatch(cards=[pending.row]),
+    )
+    monkeypatch.setattr(
+        browser_actions,
+        "preview_patch_against_collection",
+        lambda _col, _patch: [pending],
+    )
+    monkeypatch.setattr(
+        browser_actions,
+        "show_ankipatch_preview_dialog",
+        lambda _parent, _results: PatchPreviewDecision(
+            selected_rows=(pending.row,),
+            preview_only_results=(),
+        ),
+    )
+    monkeypatch.setattr(browser_actions, "showInfo", messages.append)
+
+    browser_actions.apply_ankipatch_from_file(object())
+    DeferredCollectionOp.instances[0].fail(RuntimeError("database unavailable"))
+
+    assert messages == [
+        "Could not apply ankipatch:\n\ndatabase unavailable",
+    ]
