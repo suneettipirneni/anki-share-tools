@@ -17,6 +17,7 @@ from share_tools.browser_widget import (
     default_share_tag_for_window,
     find_cids_in_scope,
     get_active_profile_key,
+    get_refresh_coordinator,
     normalize_scope_query,
     profile_key_for_collection_path,
 )
@@ -134,6 +135,24 @@ def test_profile_activation_is_idempotent_and_isolates_all_state(
     assert [
         event.cid for event in record_snapshot([], lambda cid: cid // 10, now)
     ] == [30]
+
+
+def test_refresh_coordinator_is_singleton_per_active_profile(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    configure_profile_storage(monkeypatch, tmp_path)
+    profile_a = tmp_path / "Profile A" / "collection.anki2"
+    profile_b = tmp_path / "Profile B" / "collection.anki2"
+
+    activate_tracker_profile(profile_a)
+    first = get_refresh_coordinator()
+    assert get_refresh_coordinator() is first
+
+    activate_tracker_profile(profile_b)
+    second = get_refresh_coordinator()
+
+    assert second is not first
 
 
 def test_legacy_database_is_claimed_once_and_source_is_preserved(

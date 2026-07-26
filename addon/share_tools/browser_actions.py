@@ -40,7 +40,7 @@ from .browser_widget import (
     deactivate_tracker_profile,
     ensure_active_tracker_profile,
     attach_unsuspend_tracker_widget,
-    refresh_tracker_widgets,
+    request_tracker_refresh,
     show_unsuspend_tracker_widget,
     sync_tracker_baseline_to_current_scope,
 )
@@ -95,7 +95,7 @@ def on_operation_did_execute(
     _handler: Optional[object],
 ) -> None:
     if changes.card or changes.study_queues:
-        refresh_tracker_widgets()
+        request_tracker_refresh(reason="operation")
 
 
 def on_browser_context_menu(browser: Browser, menu: QMenu) -> None:

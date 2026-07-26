@@ -32,6 +32,15 @@ class DateRange:
             raise ValueError("Date range start must be on or before its end.")
 
 
+@dataclass(frozen=True)
+class TrackerStateSnapshot:
+    tracking_enabled: bool
+    locked_scope_query: Optional[str]
+    previous_suspended_cids: tuple[int, ...]
+    captured_events: tuple[UnsuspendEvent, ...]
+    retention_days: int
+
+
 class FreshnessWindow(Enum):
     TODAY = "today"
     THIS_WEEK = "this_week"
@@ -60,6 +69,16 @@ def get_locked_scope_query() -> Optional[str]:
 
 def get_retention_days() -> int:
     return _retention_days
+
+
+def get_state_snapshot() -> TrackerStateSnapshot:
+    return TrackerStateSnapshot(
+        tracking_enabled=_tracking_enabled,
+        locked_scope_query=_locked_scope_query,
+        previous_suspended_cids=tuple(sorted(_previous_suspended_cids)),
+        captured_events=tuple(get_captured_events()),
+        retention_days=_retention_days,
+    )
 
 
 def set_retention_days(
