@@ -2,13 +2,19 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 import json
 from pathlib import Path
-from typing import Any, Iterable, Optional
+from typing import Any, Iterable, Optional, Union
+
+from anki.collection import OpChanges
 
 
 FORMAT_NAME = "anki-share-tools/ankipatch"
 FORMAT_VERSION = 1
 ANKIPATCH_SUFFIX = ".ankipatch"
 SUSPENDED_QUEUE = -1
+# These bounds keep a user-selected interchange file small enough to validate and
+# review in memory without turning the Anki UI workflow into an unbounded workload.
+MAX_ANKIPATCH_BYTES = 10 * 1024 * 1024
+MAX_ANKIPATCH_ROWS = 50_000
 
 
 @dataclass(frozen=True)
@@ -43,6 +49,21 @@ class PatchApplyResult:
     @property
     def resolved(self) -> bool:
         return self.card_id is not None
+
+
+@dataclass(frozen=True)
+class ResolvedPatchOperation:
+    row: CardPatchRow
+    card_id: int
+    note_id: int
+    previous_suspended: bool
+    target_suspended: bool
+
+
+@dataclass(frozen=True)
+class PatchOperationResult:
+    changes: OpChanges
+    results: tuple[PatchApplyResult, ...]
 
 
 def serialize_patch(patch: AnkiPatch) -> str:
@@ -81,6 +102,12 @@ def parse_patch_text(text: str) -> AnkiPatch:
     raw_cards = payload.get("cards")
     if not isinstance(raw_cards, list):
         raise ValueError("Invalid ankipatch: cards must be a list.")
+    if len(raw_cards) > MAX_ANKIPATCH_ROWS:
+        raise ValueError(
+            "Invalid ankipatch: cards exceed the "
+            f"{MAX_ANKIPATCH_ROWS:,}-row limit "
+            f"(observed {len(raw_cards):,} rows)."
+        )
 
     rows = [parse_card_row(raw_card, index) for index, raw_card in enumerate(raw_cards)]
     return AnkiPatch(
@@ -89,7 +116,20 @@ def parse_patch_text(text: str) -> AnkiPatch:
 
 
 def read_patch(path: Path) -> AnkiPatch:
-    return parse_patch_text(path.read_text(encoding="utf-8"))
+    file_size = path.stat().st_size
+    enforce_patch_byte_limit(file_size)
+    text = path.read_text(encoding="utf-8")
+    enforce_patch_byte_limit(len(text.encode("utf-8")))
+    return parse_patch_text(text)
+
+
+def enforce_patch_byte_limit(observed_bytes: int) -> None:
+    if observed_bytes > MAX_ANKIPATCH_BYTES:
+        raise ValueError(
+            "Ankipatch file exceeds the "
+            f"{MAX_ANKIPATCH_BYTES:,}-byte limit "
+            f"(observed {observed_bytes:,} bytes)."
+        )
 
 
 def write_patch(path: Path, patch: AnkiPatch) -> None:
@@ -192,14 +232,14 @@ def preview_patch_against_collection(
     return results
 
 
-def apply_patch_to_collection(col: Any, patch: AnkiPatch) -> list[PatchApplyResult]:
-    results: list[PatchApplyResult] = []
+def apply_patch_to_collection(col: Any, patch: AnkiPatch) -> PatchOperationResult:
+    prepared_rows: list[Union[ResolvedPatchOperation, PatchApplyResult]] = []
 
     for row in patch.cards:
         card_id = resolve_card_id(col, row)
 
         if card_id is None:
-            results.append(
+            prepared_rows.append(
                 PatchApplyResult(
                     row=row,
                     card_id=None,
@@ -218,7 +258,7 @@ def apply_patch_to_collection(col: Any, patch: AnkiPatch) -> list[PatchApplyResu
             note_id = int(card.nid)
 
             if currently_suspended == row.suspended:
-                results.append(
+                prepared_rows.append(
                     PatchApplyResult(
                         row=row,
                         card_id=card_id,
@@ -230,21 +270,17 @@ def apply_patch_to_collection(col: Any, patch: AnkiPatch) -> list[PatchApplyResu
                 )
                 continue
 
-            set_card_suspended(col, card_id, row.suspended)
-            results.append(
-                PatchApplyResult(
+            prepared_rows.append(
+                ResolvedPatchOperation(
                     row=row,
                     card_id=card_id,
-                    status="updated",
-                    message=(
-                        "Suspended card." if row.suspended else "Unsuspended card."
-                    ),
                     note_id=note_id,
                     previous_suspended=currently_suspended,
+                    target_suspended=row.suspended,
                 )
             )
         except Exception as exc:
-            results.append(
+            prepared_rows.append(
                 PatchApplyResult(
                     row=row,
                     card_id=card_id,
@@ -255,25 +291,57 @@ def apply_patch_to_collection(col: Any, patch: AnkiPatch) -> list[PatchApplyResu
                 )
             )
 
-    save_collection(col)
-    return results
+    operations = [
+        prepared
+        for prepared in prepared_rows
+        if isinstance(prepared, ResolvedPatchOperation)
+    ]
+    if not operations:
+        return PatchOperationResult(
+            changes=OpChanges(),
+            results=tuple(
+                prepared
+                for prepared in prepared_rows
+                if isinstance(prepared, PatchApplyResult)
+            ),
+        )
+
+    undo_entry = col.add_custom_undo_entry("Apply ankipatch")
+    suspend_card_ids = [
+        operation.card_id for operation in operations if operation.target_suspended
+    ]
+    unsuspend_card_ids = [
+        operation.card_id for operation in operations if not operation.target_suspended
+    ]
+
+    if suspend_card_ids:
+        col.sched.suspend_cards(suspend_card_ids)
+    if unsuspend_card_ids:
+        col.sched.unsuspend_cards(unsuspend_card_ids)
+
+    changes = col.merge_undo_entries(undo_entry)
+    results = tuple(
+        updated_patch_result(prepared)
+        if isinstance(prepared, ResolvedPatchOperation)
+        else prepared
+        for prepared in prepared_rows
+    )
+    return PatchOperationResult(changes=changes, results=results)
 
 
-def set_card_suspended(col: Any, card_id: int, suspended: bool) -> None:
-    scheduler = getattr(col, "sched", None)
-
-    if scheduler is not None:
-        if suspended and hasattr(scheduler, "suspend_cards"):
-            scheduler.suspend_cards([card_id])
-            return
-
-        if not suspended and hasattr(scheduler, "unsuspend_cards"):
-            scheduler.unsuspend_cards([card_id])
-            return
-
-    card = col.get_card(card_id)
-    card.queue = SUSPENDED_QUEUE if suspended else int(card.type)
-    col.update_card(card)
+def updated_patch_result(operation: ResolvedPatchOperation) -> PatchApplyResult:
+    return PatchApplyResult(
+        row=operation.row,
+        card_id=operation.card_id,
+        status="updated",
+        message=(
+            "Suspended card."
+            if operation.target_suspended
+            else "Unsuspended card."
+        ),
+        note_id=operation.note_id,
+        previous_suspended=operation.previous_suspended,
+    )
 
 
 def format_apply_report(results: list[PatchApplyResult]) -> str:
@@ -365,13 +433,6 @@ def resolve_note_guid(col: Any, note_id: int) -> str:
         raise ValueError(f"Could not resolve note guid for note id {note_id}.")
 
     return str(guid)
-
-
-def save_collection(col: Any) -> None:
-    save = getattr(col, "save", None)
-
-    if callable(save):
-        save()
 
 
 def optional_str(payload: dict[str, Any], key: str) -> Optional[str]:

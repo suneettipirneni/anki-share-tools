@@ -1,9 +1,11 @@
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
 from anki.collection import OpChanges
 from aqt import gui_hooks, mw
 from aqt.browser import Browser
+from aqt.operations import CollectionOp
 from aqt.qt import (
     QAction,
     QAbstractItemView,
@@ -25,6 +27,7 @@ from .ankipatch import (
     AnkiPatch,
     CardPatchRow,
     PatchApplyResult,
+    PatchOperationResult,
     apply_patch_to_collection,
     card_rows_from_card_ids,
     ensure_ankipatch_suffix,
@@ -48,6 +51,37 @@ from .browser_widget import (
 
 CLASS_TAG_PREFIX = "class::"
 _main_window_actions_registered = False
+
+
+@dataclass(frozen=True)
+class PatchPreviewRowModel:
+    result: PatchApplyResult
+    selectable: bool
+    checked: bool
+    status_label: str
+
+
+@dataclass(frozen=True)
+class PatchPreviewLedger:
+    rows: tuple[PatchPreviewRowModel, ...]
+
+    @property
+    def change_count(self) -> int:
+        return sum(row.selectable for row in self.rows)
+
+    @property
+    def unchanged_count(self) -> int:
+        return sum(row.result.status == "unchanged" for row in self.rows)
+
+    @property
+    def unavailable_count(self) -> int:
+        return sum(row.result.status in {"missing", "error"} for row in self.rows)
+
+
+@dataclass(frozen=True)
+class PatchPreviewDecision:
+    selected_rows: tuple[CardPatchRow, ...]
+    preview_only_results: tuple[PatchApplyResult, ...]
 
 
 def register_hooks() -> None:
@@ -237,43 +271,84 @@ def apply_ankipatch_from_file(parent: Any) -> None:
         return
 
     preview_results = preview_patch_against_collection(mw.col, patch)
-    selected_rows = show_ankipatch_preview_dialog(parent, preview_results)
+    decision = show_ankipatch_preview_dialog(parent, preview_results)
 
-    if selected_rows is None:
+    if decision is None:
         return
 
-    if not selected_rows:
+    if not decision.selected_rows:
+        final_results = combine_patch_apply_results([], decision)
+        if final_results:
+            show_ankipatch_results_dialog(parent, final_results)
         return
 
-    selected_patch = AnkiPatch(cards=selected_rows, created_at=patch.created_at)
-    results = apply_patch_to_collection(mw.col, selected_patch)
-    sync_tracker_baseline_to_current_scope()
-    maybe_reset_main_window()
-    show_ankipatch_results_dialog(parent, results)
+    selected_patch = AnkiPatch(
+        cards=list(decision.selected_rows),
+        created_at=patch.created_at,
+    )
+
+    def on_success(operation_result: PatchOperationResult) -> None:
+        sync_tracker_baseline_to_current_scope()
+        final_results = combine_patch_apply_results(
+            list(operation_result.results),
+            decision,
+        )
+        if final_results:
+            show_ankipatch_results_dialog(parent, final_results)
+
+    def on_failure(exc: Exception) -> None:
+        showInfo(f"Could not apply ankipatch:\n\n{exc}")
+
+    (
+        CollectionOp(
+            parent,
+            lambda col: apply_patch_to_collection(col, selected_patch),
+        )
+        .success(on_success)
+        .failure(on_failure)
+        .run_in_background()
+    )
+
+
+def build_patch_preview_ledger(
+    results: list[PatchApplyResult],
+) -> PatchPreviewLedger:
+    ordered_results = sorted(
+        results,
+        key=lambda result: (
+            0 if result.status in {"pending", "unchanged"} else 1,
+            result.row.note_guid.casefold(),
+            result.row.card_ord,
+            result.status,
+        ),
+    )
+    rows = tuple(
+        PatchPreviewRowModel(
+            result=result,
+            selectable=result.status == "pending",
+            checked=result.status == "pending",
+            status_label=preview_status_label(result),
+        )
+        for result in ordered_results
+    )
+    return PatchPreviewLedger(rows=rows)
+
+
+def combine_patch_apply_results(
+    applied_results: list[PatchApplyResult],
+    decision: PatchPreviewDecision,
+) -> list[PatchApplyResult]:
+    return [*applied_results, *decision.preview_only_results]
 
 
 def show_ankipatch_preview_dialog(
     parent: Any,
     results: list[PatchApplyResult],
-) -> Optional[list[CardPatchRow]]:
-    preview_rows = sorted(
-        (result for result in results if result.status in {"pending", "unchanged"}),
-        key=lambda result: tuple(
-            value.lower() for value in resolved_card_preview_values(result)[:3]
-        ),
-    )
-    change_count = sum(1 for result in preview_rows if result.status == "pending")
-    unchanged_count = len(preview_rows) - change_count
-    unavailable_count = len(results) - len(preview_rows)
-
-    if not preview_rows:
-        details = ["No patch cards could be shown."]
-        if unavailable_count:
-            details.append(
-                f"{unavailable_count} patch row(s) could not be resolved and were ignored."
-            )
-        showInfo("\n\n".join(details))
-        return None
+) -> Optional[PatchPreviewDecision]:
+    ledger = build_patch_preview_ledger(results)
+    change_count = ledger.change_count
+    unchanged_count = ledger.unchanged_count
+    unavailable_count = ledger.unavailable_count
 
     dialog = QDialog(parent)
     dialog.setWindowTitle("Review ankipatch changes")
@@ -287,7 +362,7 @@ def show_ankipatch_preview_dialog(
         )
     if unavailable_count:
         summary_parts.append(
-            f"{unavailable_count} could not be resolved and will be ignored."
+            f"{unavailable_count} cannot be applied and are shown for review."
         )
     summary = QLabel(" ".join(summary_parts), dialog)
     summary.setWordWrap(True)
@@ -302,8 +377,11 @@ def show_ankipatch_preview_dialog(
         "Current State",
         "Target State",
         "Status",
+        "Patch Note GUID",
+        "Patch Card Ord",
+        "Details",
     ]
-    table = QTableWidget(len(preview_rows), len(headers), dialog)
+    table = QTableWidget(len(ledger.rows), len(headers), dialog)
     table.setHorizontalHeaderLabels(headers)
     table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
     table.setSelectionMode(QAbstractItemView.SelectionMode.NoSelection)
@@ -311,31 +389,27 @@ def show_ankipatch_preview_dialog(
     table.verticalHeader().setVisible(False)
     table.horizontalHeader().setStretchLastSection(True)
 
-    for row_index, result in enumerate(preview_rows):
-        is_change = result.status == "pending"
+    for row_index, row_model in enumerate(ledger.rows):
         apply_item = QTableWidgetItem()
         apply_flags = (
             apply_item.flags() | Qt.ItemFlag.ItemIsUserCheckable
         ) & ~Qt.ItemFlag.ItemIsEditable
-        if not is_change:
+        if not row_model.selectable:
             apply_flags &= ~Qt.ItemFlag.ItemIsEnabled
         apply_item.setFlags(apply_flags)
         apply_item.setCheckState(
-            Qt.CheckState.Checked if is_change else Qt.CheckState.Unchecked
+            Qt.CheckState.Checked if row_model.checked else Qt.CheckState.Unchecked
         )
         table.setItem(row_index, 0, apply_item)
 
-        values = [
-            *resolved_card_preview_values(result),
-            "Will change" if is_change else "Same state",
-        ]
+        values = preview_result_values(row_model)
         for column_index, value in enumerate(
             values,
             start=1,
         ):
             item = QTableWidgetItem(value)
             item_flags = item.flags() & ~Qt.ItemFlag.ItemIsEditable
-            if not is_change:
+            if not row_model.selectable:
                 item_flags &= ~Qt.ItemFlag.ItemIsEnabled
             item.setFlags(item_flags)
             table.setItem(row_index, column_index, item)
@@ -357,12 +431,53 @@ def show_ankipatch_preview_dialog(
     if dialog.exec() != QDialog.DialogCode.Accepted:
         return None
 
-    return [
-        result.row
-        for row_index, result in enumerate(preview_rows)
-        if result.status == "pending"
+    selected_rows = tuple(
+        row_model.result.row
+        for row_index, row_model in enumerate(ledger.rows)
+        if row_model.selectable
         and table.item(row_index, 0).checkState() == Qt.CheckState.Checked
+    )
+    preview_only_results = tuple(
+        row_model.result
+        for row_model in ledger.rows
+        if row_model.result.status in {"missing", "error"}
+    )
+    return PatchPreviewDecision(
+        selected_rows=selected_rows,
+        preview_only_results=preview_only_results,
+    )
+
+
+def preview_result_values(row_model: PatchPreviewRowModel) -> list[str]:
+    result = row_model.result
+    if result.status in {"pending", "unchanged"}:
+        resolved_values = resolved_card_preview_values(result)
+    else:
+        resolved_values = ["", "", "", "", "", target_state_label(result)]
+
+    return [
+        *resolved_values,
+        row_model.status_label,
+        result.row.note_guid,
+        str(result.row.card_ord),
+        result.message,
     ]
+
+
+def preview_status_label(result: PatchApplyResult) -> str:
+    if result.status == "pending":
+        return "Will change"
+    if result.status == "unchanged":
+        return "Same state"
+    if result.status == "missing":
+        return "Missing"
+    if result.status == "error":
+        return "Error"
+    return result.status
+
+
+def target_state_label(result: PatchApplyResult) -> str:
+    return "Suspended" if result.row.suspended else "Unsuspended"
 
 
 def resolved_card_preview_values(result: PatchApplyResult) -> list[str]:
@@ -378,7 +493,7 @@ def resolved_card_preview_values(result: PatchApplyResult) -> list[str]:
         get_deck_name(card),
         get_due_text(card),
         suspended_state_label(result.previous_suspended),
-        "Suspended" if result.row.suspended else "Unsuspended",
+        target_state_label(result),
     ]
 
 
@@ -491,7 +606,7 @@ def resolved_card_result_values(result: PatchApplyResult) -> list[str]:
         get_deck_name(card),
         get_due_text(card),
         suspended_state_label(result.previous_suspended),
-        "Suspended" if result.row.suspended else "Unsuspended",
+        target_state_label(result),
         result_status_label(result),
         result.message,
     ]
@@ -521,7 +636,7 @@ def build_unresolved_rows_table(
         values = [
             result.row.note_guid,
             str(result.row.card_ord),
-            "Suspended" if result.row.suspended else "Unsuspended",
+            target_state_label(result),
             result_status_label(result),
             result.message,
         ]
@@ -701,10 +816,3 @@ def choose_tags_if_needed(
 
 def debug_show(value: Any) -> None:
     showInfo(str(value))
-
-
-def maybe_reset_main_window() -> None:
-    reset = getattr(mw, "reset", None)
-
-    if callable(reset):
-        reset()

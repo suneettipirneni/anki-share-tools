@@ -36,14 +36,19 @@ The Browser panel lets you:
 - Filter captured unsuspensions with Today and This week shortcuts or an
   inclusive custom date range.
 - Export fresh unsuspensions as a portable `.ankipatch`.
-- Review pending card changes, choose which ones to apply, and inspect per-card results.
+- Review the full patch ledger, choose which changes to apply, and inspect
+  per-card results.
 
 It exposes these actions under the Share Tools menu:
 
 - Show fresh cards panel: reopens the Browser side panel if it was hidden.
 - Export selected cards as ankipatch: saves selected cards with portable note GUID, card ordinal, and suspended/unsuspended state.
 - Export current unsuspended class subset as ankipatch: infers the selected `class::` tag and exports matching unsuspended cards.
-- Apply ankipatch: previews only cards whose state would change, lets you choose which changes to apply, and reports successful and unsuccessful applications.
+- Apply ankipatch: previews every patch row. Changes are checked and labeled
+  `Will change`; matching cards remain visible but disabled as `Same state`;
+  unresolved or errored rows are visible but cannot be selected. Only selected
+  pending changes are applied, and final results include applied and unresolved
+  rows.
 
 You can also apply an `.ankipatch` from Anki's Tools menu.
 
