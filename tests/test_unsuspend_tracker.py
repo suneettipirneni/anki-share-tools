@@ -1,9 +1,13 @@
 from datetime import date, datetime
 import json
 import sqlite3
+from types import SimpleNamespace
+from typing import Optional
 
 import pytest
+from anki.errors import NotFoundError
 
+from share_tools import browser_widget
 from share_tools.unsuspend_tracker import (
     DateRange,
     FreshnessWindow,
@@ -46,6 +50,35 @@ def cid_to_nid(cid: int) -> int:
     return cid // 10
 
 
+def test_browser_card_resolver_returns_none_only_for_missing_cards(
+    monkeypatch,
+) -> None:
+    def missing_card(_cid: int) -> None:
+        raise NotFoundError("missing", None, None, None)
+
+    monkeypatch.setattr(
+        browser_widget,
+        "mw",
+        SimpleNamespace(col=SimpleNamespace(get_card=missing_card)),
+    )
+
+    assert browser_widget.cid_to_nid(10) is None
+
+
+def test_browser_card_resolver_propagates_unexpected_errors(monkeypatch) -> None:
+    def broken_card_lookup(_cid: int) -> None:
+        raise RuntimeError("backend unavailable")
+
+    monkeypatch.setattr(
+        browser_widget,
+        "mw",
+        SimpleNamespace(col=SimpleNamespace(get_card=broken_card_lookup)),
+    )
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        browser_widget.cid_to_nid(10)
+
+
 def test_lock_scope_stores_baseline_enables_tracking_and_clears_events() -> None:
     lock_scope("tag:old", [10])
     record_snapshot([], cid_to_nid, now=datetime(2026, 6, 15, 9))
@@ -70,6 +103,86 @@ def test_record_snapshot_captures_cards_removed_from_suspended_set() -> None:
             detected_at=now,
             scope_query="tag:class::cardiology",
         )
+    ]
+
+
+def test_deleted_baseline_card_is_pruned_without_creating_event() -> None:
+    resolver_calls: list[int] = []
+
+    def resolve_missing_card(cid: int) -> None:
+        resolver_calls.append(cid)
+        return None
+
+    lock_scope("tag:class::cardiology", [10])
+
+    assert record_snapshot([], resolve_missing_card) == []
+    assert record_snapshot([], resolve_missing_card) == []
+    assert resolver_calls == [10]
+    assert get_captured_events() == []
+
+
+def test_deleted_and_valid_departures_are_partitioned_in_one_snapshot() -> None:
+    def resolve_card(cid: int) -> Optional[int]:
+        return None if cid == 10 else cid // 10
+
+    now = datetime(2026, 6, 15, 10)
+    lock_scope("tag:class::cardiology", [10, 20])
+
+    assert record_snapshot([], resolve_card, now=now) == [
+        UnsuspendEvent(
+            cid=20,
+            nid=2,
+            detected_at=now,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+    assert get_captured_events() == [
+        UnsuspendEvent(
+            cid=20,
+            nid=2,
+            detected_at=now,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+
+
+def test_deleted_baseline_card_is_not_retried_after_restart(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    initialize_storage(database_path)
+    lock_scope("tag:class::cardiology", [10])
+
+    assert record_snapshot([], lambda _cid: None) == []
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path)
+
+    def unexpected_resolver_call(_cid: int) -> None:
+        raise AssertionError("deleted card was retried")
+
+    assert record_snapshot([], unexpected_resolver_call) == []
+
+
+def test_resolver_failure_does_not_partially_advance_snapshot(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    now = datetime(2026, 6, 15, 10)
+    initialize_storage(database_path)
+    lock_scope("tag:class::cardiology", [10, 20])
+
+    def fail_after_first_resolution(cid: int) -> int:
+        if cid == 20:
+            raise RuntimeError("backend unavailable")
+        return cid // 10
+
+    with pytest.raises(RuntimeError, match="backend unavailable"):
+        record_snapshot([], fail_after_first_resolution, now=now)
+
+    assert get_captured_events() == []
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path)
+    assert record_snapshot([], cid_to_nid, now=now) == [
+        UnsuspendEvent(10, 1, now, "tag:class::cardiology"),
+        UnsuspendEvent(20, 2, now, "tag:class::cardiology"),
     ]
 
 

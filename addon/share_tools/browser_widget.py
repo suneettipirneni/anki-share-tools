@@ -6,6 +6,7 @@ import tempfile
 from typing import Optional, Union
 from weakref import WeakSet
 
+from anki.errors import NotFoundError
 from aqt import mw
 from aqt.browser import Browser
 from aqt.qt import (
@@ -570,8 +571,11 @@ def find_suspended_cids_in_scope(scope_query: str) -> list[int]:
     return sorted(int(cid) for cid in mw.col.find_cards(query))
 
 
-def cid_to_nid(cid: int) -> int:
-    return int(mw.col.get_card(cid).nid)
+def cid_to_nid(cid: int) -> Optional[int]:
+    try:
+        return int(mw.col.get_card(cid).nid)
+    except NotFoundError:
+        return None
 
 
 def get_note_sort_field(nid: int) -> str:

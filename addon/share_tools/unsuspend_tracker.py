@@ -95,27 +95,39 @@ def lock_scope(scope_query: str, suspended_cids: Iterable[int]) -> None:
 
 def record_snapshot(
     current_suspended_cids: Iterable[int],
-    cid_to_nid: Callable[[int], int],
+    cid_to_nid: Callable[[int], Optional[int]],
     now: Optional[datetime] = None,
 ) -> list[UnsuspendEvent]:
     if not _tracking_enabled or _locked_scope_query is None:
         return []
 
     detected_at = now or datetime.now()
-    sweep_expired_events(detected_at)
     current_suspended = {int(cid) for cid in current_suspended_cids}
     previous_suspended = set(_previous_suspended_cids)
-    removed_event_cids = current_suspended & _captured_events_by_cid.keys()
+    cutoff_date = retention_cutoff_date(_retention_days, detected_at.date())
+    expired_event_cids = {
+        event.cid
+        for event in _captured_events_by_cid.values()
+        if cutoff_date is not None and event.detected_at.date() < cutoff_date
+    }
+    removed_event_cids = (
+        current_suspended & _captured_events_by_cid.keys()
+    ) | expired_event_cids
     newly_unsuspended = sorted(previous_suspended - current_suspended)
     new_events: list[UnsuspendEvent] = []
 
     for cid in newly_unsuspended:
-        if cid in _captured_events_by_cid:
+        if cid in _captured_events_by_cid and cid not in expired_event_cids:
+            continue
+
+        nid = cid_to_nid(cid)
+
+        if nid is None:
             continue
 
         event = UnsuspendEvent(
             cid=cid,
-            nid=int(cid_to_nid(cid)),
+            nid=int(nid),
             detected_at=detected_at,
             scope_query=_locked_scope_query,
         )
