@@ -1,5 +1,6 @@
 from datetime import datetime
 from pathlib import Path
+from typing import Optional
 from weakref import WeakSet
 
 from aqt import mw
@@ -8,6 +9,8 @@ from aqt.qt import (
     QAbstractItemView,
     QAction,
     QComboBox,
+    QDate,
+    QDateEdit,
     QDockWidget,
     QFileDialog,
     QHBoxLayout,
@@ -31,13 +34,22 @@ from .ankipatch import (
     write_patch,
 )
 from . import unsuspend_tracker
-from .unsuspend_tracker import FreshnessWindow
+from .unsuspend_tracker import DateRange, FreshnessWindow
 
 
-STATE_FILE = Path(__file__).resolve().parents[1] / "unsuspend_tracker_state.json"
+ADDON_DIR = Path(__file__).resolve().parents[1]
+DATABASE_FILE = ADDON_DIR / "user_files" / "fresh_card_state.sqlite3"
+LEGACY_STATE_FILE = ADDON_DIR / "unsuspend_tracker_state.json"
 TIMER_INTERVAL_MS = 2000
 DOCK_ATTRIBUTE = "_share_tools_unsuspend_tracker_dock"
-TOGGLE_SUSPEND_ACTION_ATTRIBUTE = "_share_tools_toggle_suspend_refresh_connected"
+CUSTOM_RANGE_VALUE = "custom"
+RETENTION_OPTIONS = (
+    ("1 month", 30),
+    ("1 week", 7),
+    ("1 day", 1),
+    ("1 year", 365),
+    ("Forever", 0),
+)
 _state_loaded = False
 _widgets: WeakSet["UnsuspendTrackerWidget"] = WeakSet()
 
@@ -54,16 +66,44 @@ class UnsuspendTrackerWidget(QWidget):
         self.scope_label = QLabel(self)
         self.scope_label.setWordWrap(True)
         self.count_label = QLabel(self)
+        self.retention_combo = QComboBox(self)
+        for label, retention_days in RETENTION_OPTIONS:
+            self.retention_combo.addItem(label, retention_days)
+        self.retention_combo.setToolTip(
+            "Fresh unsuspends older than the selected duration are deleted."
+        )
+        self.sync_retention_combo()
+        self.retention_combo.currentIndexChanged.connect(self.on_retention_changed)
         self.window_combo = QComboBox(self)
         self.window_combo.addItem("Today", FreshnessWindow.TODAY.value)
         self.window_combo.addItem("This week", FreshnessWindow.THIS_WEEK.value)
-        self.window_combo.currentIndexChanged.connect(lambda _: self.update_view())
+        self.window_combo.addItem("Custom range", CUSTOM_RANGE_VALUE)
+        today = QDate.currentDate()
+        self.from_date_label = QLabel("From:", self)
+        self.from_date_edit = QDateEdit(today, self)
+        self.from_date_edit.setCalendarPopup(True)
+        self.from_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.from_date_edit.setMaximumDate(today)
+        self.from_date_label.setVisible(False)
+        self.from_date_edit.setVisible(False)
+        self.to_date_label = QLabel("To:", self)
+        self.to_date_edit = QDateEdit(today, self)
+        self.to_date_edit.setCalendarPopup(True)
+        self.to_date_edit.setDisplayFormat("yyyy-MM-dd")
+        self.to_date_edit.setMaximumDate(today)
+        self.to_date_label.setVisible(False)
+        self.to_date_edit.setVisible(False)
+        self.window_combo.currentIndexChanged.connect(self.on_window_changed)
+        self.from_date_edit.dateChanged.connect(self.on_from_date_changed)
+        self.to_date_edit.dateChanged.connect(self.on_to_date_changed)
         self.events_table = QTableWidget(0, 6, self)
         self.events_table.setHorizontalHeaderLabels(
             ["Detected", "Sort field", "Card type", "Card ID", "Note ID", "Scope"]
         )
         self.events_table.setEditTriggers(QTableWidget.EditTrigger.NoEditTriggers)
-        self.events_table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
+        self.events_table.setSelectionBehavior(
+            QTableWidget.SelectionBehavior.SelectRows
+        )
         self.events_table.setSelectionMode(
             QAbstractItemView.SelectionMode.ExtendedSelection
         )
@@ -101,10 +141,22 @@ class UnsuspendTrackerWidget(QWidget):
         layout.addWidget(self.tracking_label)
         layout.addWidget(self.scope_label)
 
+        retention_layout = QHBoxLayout()
+        retention_layout.addWidget(QLabel("Keep fresh unsuspends for:", self))
+        retention_layout.addWidget(self.retention_combo)
+        layout.addLayout(retention_layout)
+
         window_layout = QHBoxLayout()
         window_layout.addWidget(QLabel("Window:", self))
         window_layout.addWidget(self.window_combo)
         layout.addLayout(window_layout)
+
+        date_range_layout = QHBoxLayout()
+        date_range_layout.addWidget(self.from_date_label)
+        date_range_layout.addWidget(self.from_date_edit)
+        date_range_layout.addWidget(self.to_date_label)
+        date_range_layout.addWidget(self.to_date_edit)
+        layout.addLayout(date_range_layout)
 
         layout.addWidget(self.count_label)
         layout.addWidget(self.events_table)
@@ -116,19 +168,93 @@ class UnsuspendTrackerWidget(QWidget):
         layout.addStretch(1)
         self.setLayout(layout)
 
-    def selected_window(self) -> FreshnessWindow:
+    def selected_preset_window(self) -> Optional[FreshnessWindow]:
         if not is_widget_alive(self.window_combo):
             return FreshnessWindow.TODAY
 
         value = self.window_combo.currentData()
         if value == FreshnessWindow.THIS_WEEK.value:
             return FreshnessWindow.THIS_WEEK
-        return FreshnessWindow.TODAY
+        if value == FreshnessWindow.TODAY.value:
+            return FreshnessWindow.TODAY
+        return None
+
+    def on_retention_changed(self, _index: int) -> None:
+        retention_days = int(self.retention_combo.currentData())
+        removed_count = unsuspend_tracker.set_retention_days(retention_days)
+        refresh_tracker_widget_views()
+
+        if removed_count:
+            tooltip(f"Removed {removed_count} expired fresh unsuspend(s).")
+
+    def sync_retention_combo(self) -> None:
+        retention_days = unsuspend_tracker.get_retention_days()
+        preset_values = {value for _label, value in RETENTION_OPTIONS}
+        signals_were_blocked = self.retention_combo.blockSignals(True)
+
+        for index in reversed(range(self.retention_combo.count())):
+            value = int(self.retention_combo.itemData(index))
+            if value not in preset_values:
+                self.retention_combo.removeItem(index)
+
+        selected_index = self.retention_combo.findData(retention_days)
+        if selected_index == -1:
+            self.retention_combo.addItem(
+                f"{retention_days} days (current)",
+                retention_days,
+            )
+            selected_index = self.retention_combo.count() - 1
+
+        self.retention_combo.setCurrentIndex(selected_index)
+        self.retention_combo.blockSignals(signals_were_blocked)
+
+    def selected_date_range(self) -> DateRange:
+        preset = self.selected_preset_window()
+
+        if preset is not None:
+            return unsuspend_tracker.date_range_for_window(preset)
+
+        return DateRange(
+            start=self.from_date_edit.date().toPyDate(),
+            end=self.to_date_edit.date().toPyDate(),
+        )
+
+    def on_window_changed(self, _index: int) -> None:
+        custom_range_selected = self.selected_preset_window() is None
+
+        for widget in (
+            self.from_date_label,
+            self.from_date_edit,
+            self.to_date_label,
+            self.to_date_edit,
+        ):
+            widget.setVisible(custom_range_selected)
+
+        self.update_view()
+
+    def on_from_date_changed(self, selected_date: QDate) -> None:
+        if selected_date > self.to_date_edit.date():
+            self.to_date_edit.setDate(selected_date)
+            return
+
+        self.update_view()
+
+    def on_to_date_changed(self, selected_date: QDate) -> None:
+        if selected_date < self.from_date_edit.date():
+            self.from_date_edit.setDate(selected_date)
+            return
+
+        self.update_view()
 
     def update_view(self) -> None:
         if not is_widget_alive(self):
             return
 
+        self.sync_retention_combo()
+
+        today = QDate.currentDate()
+        self.from_date_edit.setMaximumDate(today)
+        self.to_date_edit.setMaximumDate(today)
         tracking_status = "On" if unsuspend_tracker.is_tracking_enabled() else "Off"
         scope_query = unsuspend_tracker.get_locked_scope_query()
         if scope_query is None:
@@ -137,7 +263,7 @@ class UnsuspendTrackerWidget(QWidget):
             scope_text = scope_query
         else:
             scope_text = "Whole collection"
-        count = unsuspend_tracker.count_for_window(self.selected_window())
+        count = unsuspend_tracker.count_for_date_range(self.selected_date_range())
 
         self.tracking_label.setText(f"Tracking: {tracking_status}")
         self.scope_label.setText(f"Scope: {scope_text}")
@@ -148,8 +274,8 @@ class UnsuspendTrackerWidget(QWidget):
         if not is_widget_alive(self.events_table):
             return
 
-        events = unsuspend_tracker.get_captured_events_for_window(
-            self.selected_window()
+        events = unsuspend_tracker.get_captured_events_for_date_range(
+            self.selected_date_range()
         )
         self.events_table.setRowCount(len(events))
 
@@ -210,9 +336,6 @@ class UnsuspendTrackerWidget(QWidget):
     def remove_selected_fresh_unsuspends(self, card_ids: list[int]) -> None:
         removed_count = unsuspend_tracker.remove_captured_cids(card_ids)
 
-        if removed_count:
-            save_tracker_state()
-
         self.update_view()
         tooltip(f"Removed {removed_count} fresh unsuspend(s).")
 
@@ -227,7 +350,6 @@ class UnsuspendTrackerWidget(QWidget):
 
         suspended_cids = find_suspended_cids_in_scope(scope_query)
         unsuspend_tracker.lock_scope(scope_query, suspended_cids)
-        save_tracker_state()
         self.update_view()
         tooltip(f"Locked scope with {len(suspended_cids)} suspended card(s).")
 
@@ -252,7 +374,6 @@ class UnsuspendTrackerWidget(QWidget):
                 current_suspended_cids=current_suspended_cids,
                 cid_to_nid=cid_to_nid,
             )
-            save_tracker_state()
         except Exception as exc:
             if show_errors:
                 showInfo(f"Could not refresh unsuspend tracker:\n\n{exc}")
@@ -260,9 +381,8 @@ class UnsuspendTrackerWidget(QWidget):
         self.update_view()
 
     def export_fresh_card_patch(self) -> None:
-        card_ids = unsuspend_tracker.get_captured_cids_for_window(
-            self.selected_window()
-        )
+        date_range = self.selected_date_range()
+        card_ids = unsuspend_tracker.get_captured_cids_for_date_range(date_range)
 
         if not card_ids:
             showInfo("No fresh unsuspended cards found for the selected window.")
@@ -274,10 +394,16 @@ class UnsuspendTrackerWidget(QWidget):
             showInfo(f"Could not build ankipatch:\n\n{exc}")
             return
 
+        preset = self.selected_preset_window()
+        default_filename = (
+            default_ankipatch_filename(preset)
+            if preset is not None
+            else default_ankipatch_filename_for_date_range(date_range)
+        )
         selected_path, _filter = QFileDialog.getSaveFileName(
             self,
             "Save ankipatch",
-            default_ankipatch_filename(self.selected_window()),
+            default_filename,
             "Anki patch (*.ankipatch)",
         )
 
@@ -301,14 +427,12 @@ class UnsuspendTrackerWidget(QWidget):
 
     def clear_captured(self) -> None:
         unsuspend_tracker.clear_captured()
-        save_tracker_state()
         self.update_view()
 
 
 def attach_unsuspend_tracker_widget(browser: Browser) -> None:
     load_tracker_state_once()
     ensure_default_scope_locked()
-    connect_toggle_suspend_action(browser)
 
     ensure_unsuspend_tracker_dock(browser, show=False)
 
@@ -316,7 +440,6 @@ def attach_unsuspend_tracker_widget(browser: Browser) -> None:
 def show_unsuspend_tracker_widget(browser: Browser) -> None:
     load_tracker_state_once()
     ensure_default_scope_locked()
-    connect_toggle_suspend_action(browser)
     ensure_unsuspend_tracker_dock(browser, show=True)
 
 
@@ -351,25 +474,6 @@ def ensure_default_scope_locked() -> None:
 
     suspended_cids = find_suspended_cids_in_scope("")
     unsuspend_tracker.lock_scope("", suspended_cids)
-    save_tracker_state()
-
-
-def connect_toggle_suspend_action(browser: Browser) -> None:
-    if getattr(browser, TOGGLE_SUSPEND_ACTION_ATTRIBUTE, False):
-        return
-
-    action = getattr(getattr(browser, "form", None), "actionToggle_Suspend", None)
-
-    if action is None:
-        return
-
-    action.triggered.connect(lambda _checked=False: refresh_tracker_widgets_after_delay())
-    setattr(browser, TOGGLE_SUSPEND_ACTION_ATTRIBUTE, True)
-
-
-def refresh_tracker_widgets_after_delay() -> None:
-    QTimer.singleShot(750, refresh_tracker_widgets)
-    QTimer.singleShot(2000, refresh_tracker_widgets)
 
 
 def sync_tracker_baseline_to_current_scope() -> None:
@@ -383,7 +487,6 @@ def sync_tracker_baseline_to_current_scope() -> None:
     scope_query = unsuspend_tracker.get_locked_scope_query() or ""
     current_suspended_cids = find_suspended_cids_in_scope(scope_query)
     unsuspend_tracker.sync_baseline_without_capturing(current_suspended_cids)
-    save_tracker_state()
     refresh_tracker_widget_views()
 
 
@@ -509,8 +612,11 @@ def default_ankipatch_filename(window: FreshnessWindow) -> str:
     return f"fresh_unsuspends_{now.date().isoformat()}.ankipatch"
 
 
-def save_tracker_state() -> None:
-    unsuspend_tracker.save_state(STATE_FILE)
+def default_ankipatch_filename_for_date_range(date_range: DateRange) -> str:
+    return (
+        f"fresh_unsuspends_{date_range.start.isoformat()}"
+        f"_to_{date_range.end.isoformat()}.ankipatch"
+    )
 
 
 def load_tracker_state_once() -> None:
@@ -519,5 +625,5 @@ def load_tracker_state_once() -> None:
     if _state_loaded:
         return
 
-    unsuspend_tracker.load_state(STATE_FILE)
+    unsuspend_tracker.initialize_storage(DATABASE_FILE, LEGACY_STATE_FILE)
     _state_loaded = True

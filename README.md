@@ -29,8 +29,12 @@ The Browser panel lets you:
 
 - Lock the current search as the tracking scope.
 - Passively capture cards that become unsuspended while Anki is open.
-- Keep captured unsuspensions across Anki restarts.
-- Switch between Today and This week freshness windows.
+- Keep captured unsuspensions and the suspended-card baseline in an add-on-owned
+  SQLite database across Anki restarts.
+- Choose a retention period of 1 day, 1 week, 1 month (the default), 1 year, or
+  forever; expired entries are removed automatically.
+- Filter captured unsuspensions with Today and This week shortcuts or an
+  inclusive custom date range.
 - Export fresh unsuspensions as a portable `.ankipatch`.
 - Review pending card changes, choose which ones to apply, and inspect per-card results.
 

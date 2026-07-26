@@ -1,31 +1,44 @@
-from datetime import datetime
+from datetime import date, datetime
+import json
+import sqlite3
 
 import pytest
 
 from share_tools.unsuspend_tracker import (
+    DateRange,
     FreshnessWindow,
     UnsuspendEvent,
     clear_all,
     clear_captured,
     count_for_window,
+    count_for_date_range,
+    date_range_for_window,
     get_captured_cids_for_window,
+    get_captured_cids_for_date_range,
     get_captured_events,
+    get_captured_events_for_date_range,
     get_captured_events_for_window,
+    get_captured_nids_for_date_range,
     get_captured_nids_for_window,
     get_locked_scope_query,
+    get_retention_days,
+    initialize_storage,
     is_tracking_enabled,
     load_state,
     lock_scope,
     record_snapshot,
     remove_captured_cids,
     save_state,
+    set_retention_days,
     apply_state,
+    shutdown_storage,
     sync_baseline_without_capturing,
 )
 
 
 @pytest.fixture(autouse=True)
 def reset_tracker() -> None:
+    shutdown_storage()
     clear_all()
 
 
@@ -70,6 +83,28 @@ def test_duplicate_snapshots_do_not_duplicate_events() -> None:
         FreshnessWindow.TODAY,
         now=datetime(2026, 6, 15, 12),
     ) == [20]
+
+
+def test_consecutive_unsuspend_snapshots_accumulate_events() -> None:
+    lock_scope("tag:class::cardiology", [10, 20, 30])
+
+    first_events = record_snapshot(
+        [20, 30],
+        cid_to_nid,
+        now=datetime(2026, 6, 15, 10),
+    )
+    second_events = record_snapshot(
+        [30],
+        cid_to_nid,
+        now=datetime(2026, 6, 15, 11),
+    )
+
+    assert [event.cid for event in first_events] == [10]
+    assert [event.cid for event in second_events] == [20]
+    assert get_captured_cids_for_window(
+        FreshnessWindow.TODAY,
+        now=datetime(2026, 6, 15, 12),
+    ) == [10, 20]
 
 
 def test_resuspended_cards_are_removed_from_captured_events() -> None:
@@ -164,14 +199,106 @@ def test_this_week_window_excludes_events_before_current_week() -> None:
     ) == [20]
 
 
+def test_date_range_includes_entire_boundary_dates_and_excludes_neighbors() -> None:
+    lock_scope("deck:current", [10, 20, 30, 40])
+    record_snapshot(
+        [20, 30, 40],
+        cid_to_nid,
+        now=datetime(2026, 6, 14, 23, 59, 59),
+    )
+    record_snapshot(
+        [30, 40],
+        cid_to_nid,
+        now=datetime(2026, 6, 15, 0, 0),
+    )
+    record_snapshot(
+        [40],
+        cid_to_nid,
+        now=datetime(2026, 6, 17, 23, 59, 59),
+    )
+    record_snapshot([], cid_to_nid, now=datetime(2026, 6, 18, 0, 0))
+
+    selected_range = DateRange(start=date(2026, 6, 15), end=date(2026, 6, 17))
+
+    assert [
+        event.cid for event in get_captured_events_for_date_range(selected_range)
+    ] == [20, 30]
+    assert get_captured_cids_for_date_range(selected_range) == [20, 30]
+    assert get_captured_nids_for_date_range(selected_range) == [2, 3]
+    assert count_for_date_range(selected_range) == 2
+
+
+def test_single_day_date_range_includes_only_that_date() -> None:
+    lock_scope("deck:current", [10, 20])
+    record_snapshot([20], cid_to_nid, now=datetime(2026, 6, 15, 23, 59))
+    record_snapshot([], cid_to_nid, now=datetime(2026, 6, 16, 0, 0))
+
+    assert get_captured_cids_for_date_range(
+        DateRange(start=date(2026, 6, 15), end=date(2026, 6, 15))
+    ) == [10]
+
+
+def test_date_range_rejects_end_before_start() -> None:
+    with pytest.raises(ValueError, match="start must be on or before"):
+        DateRange(start=date(2026, 6, 16), end=date(2026, 6, 15))
+
+
+def test_freshness_windows_resolve_to_date_ranges() -> None:
+    now = datetime(2026, 6, 17, 13)
+
+    assert date_range_for_window(FreshnessWindow.TODAY, now) == DateRange(
+        start=date(2026, 6, 17),
+        end=date(2026, 6, 17),
+    )
+    assert date_range_for_window(FreshnessWindow.THIS_WEEK, now) == DateRange(
+        start=date(2026, 6, 15),
+        end=date(2026, 6, 17),
+    )
+
+
 def test_count_for_window_returns_expected_value() -> None:
     lock_scope("deck:current", [10, 20])
     record_snapshot([], cid_to_nid, now=datetime(2026, 6, 15, 12))
 
-    assert count_for_window(
-        FreshnessWindow.TODAY,
-        now=datetime(2026, 6, 15, 13),
-    ) == 2
+    assert (
+        count_for_window(
+            FreshnessWindow.TODAY,
+            now=datetime(2026, 6, 15, 13),
+        )
+        == 2
+    )
+
+
+def test_default_retention_is_thirty_days() -> None:
+    assert get_retention_days() == 30
+
+
+def test_setting_retention_sweeps_dates_before_inclusive_cutoff() -> None:
+    lock_scope("deck:current", [10, 20, 30])
+    record_snapshot([20, 30], cid_to_nid, now=datetime(2026, 6, 1, 23, 59))
+    record_snapshot([30], cid_to_nid, now=datetime(2026, 6, 2, 0, 0))
+    record_snapshot([], cid_to_nid, now=datetime(2026, 6, 30, 12))
+
+    removed_count = set_retention_days(29, now=datetime(2026, 6, 30, 12))
+
+    assert removed_count == 1
+    assert get_retention_days() == 29
+    assert [event.cid for event in get_captured_events()] == [20, 30]
+
+
+def test_forever_retention_does_not_sweep_old_events() -> None:
+    lock_scope("deck:current", [10])
+    record_snapshot([], cid_to_nid, now=datetime(2020, 1, 1, 12))
+
+    assert set_retention_days(0, now=datetime(2026, 6, 30, 12)) == 0
+    assert get_captured_cids_for_date_range(
+        DateRange(start=date(2020, 1, 1), end=date(2020, 1, 1))
+    ) == [10]
+
+
+def test_negative_retention_is_rejected() -> None:
+    with pytest.raises(ValueError, match="cannot be negative"):
+        set_retention_days(-1)
 
 
 def test_clear_captured_preserves_scope_and_tracking() -> None:
@@ -197,7 +324,7 @@ def test_clear_all_clears_tracker_state() -> None:
 
 
 def test_save_and_load_state_round_trips_tracker_state(tmp_path) -> None:
-    state_path = tmp_path / "tracker.json"
+    state_path = tmp_path / "tracker.sqlite3"
     detected_at = datetime(2026, 6, 15, 12)
 
     lock_scope("deck:current", [10, 20])
@@ -225,6 +352,141 @@ def test_save_and_load_state_round_trips_tracker_state(tmp_path) -> None:
             scope_query="deck:current",
         )
     ]
+
+
+def test_initialized_storage_persists_mutations_automatically(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    detected_at = datetime(2026, 6, 15, 12)
+
+    initialize_storage(database_path, now=datetime(2026, 6, 15, 12))
+    lock_scope("deck:current", [10, 20])
+    record_snapshot([20], cid_to_nid, now=detected_at)
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path, now=datetime(2026, 6, 15, 12))
+
+    assert get_locked_scope_query() == "deck:current"
+    assert get_captured_events() == [
+        UnsuspendEvent(
+            cid=10,
+            nid=1,
+            detected_at=detected_at,
+            scope_query="deck:current",
+        )
+    ]
+
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("SELECT retention_days FROM tracker").fetchone() == (
+            30,
+        )
+        assert connection.execute(
+            "SELECT cid FROM suspended_baseline ORDER BY cid"
+        ).fetchall() == [(20,)]
+        assert connection.execute(
+            "SELECT cid, nid FROM fresh_unsuspends"
+        ).fetchall() == [(10, 1)]
+
+
+def test_initialize_storage_migrates_legacy_json_state(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    legacy_path.write_text(
+        json.dumps(
+            {
+                "version": 1,
+                "tracking_enabled": True,
+                "locked_scope_query": "tag:class::cardiology",
+                "previous_suspended_cids": [20],
+                "captured_events": [
+                    {
+                        "cid": 10,
+                        "nid": 1,
+                        "detected_at": "2026-06-15T12:00:00",
+                        "scope_query": "tag:class::cardiology",
+                    }
+                ],
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    initialize_storage(
+        database_path,
+        legacy_path,
+        now=datetime(2026, 6, 15, 12),
+    )
+    shutdown_storage()
+    clear_all()
+    initialize_storage(
+        database_path,
+        legacy_path,
+        now=datetime(2026, 6, 15, 12),
+    )
+
+    assert get_locked_scope_query() == "tag:class::cardiology"
+    assert get_captured_events() == [
+        UnsuspendEvent(
+            cid=10,
+            nid=1,
+            detected_at=datetime(2026, 6, 15, 12),
+            scope_query="tag:class::cardiology",
+        )
+    ]
+
+
+def test_retention_setting_and_sweep_persist_across_restarts(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+
+    initialize_storage(database_path, now=datetime(2026, 6, 30, 12))
+    set_retention_days(0, now=datetime(2026, 6, 30, 12))
+    lock_scope("deck:current", [10, 20])
+    record_snapshot([20], cid_to_nid, now=datetime(2026, 5, 1, 12))
+    record_snapshot([], cid_to_nid, now=datetime(2026, 6, 30, 12))
+
+    assert set_retention_days(7, now=datetime(2026, 6, 30, 12)) == 1
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path, now=datetime(2026, 6, 30, 12))
+
+    assert get_retention_days() == 7
+    assert [event.cid for event in get_captured_events()] == [20]
+
+
+def test_version_one_database_migrates_to_thirty_day_retention(tmp_path) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+
+    with sqlite3.connect(database_path) as connection:
+        connection.executescript(
+            """
+            CREATE TABLE tracker (
+                singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                locked_scope_query TEXT
+            );
+            CREATE TABLE suspended_baseline (cid INTEGER PRIMARY KEY);
+            CREATE TABLE fresh_unsuspends (
+                cid INTEGER PRIMARY KEY,
+                nid INTEGER NOT NULL,
+                detected_at TEXT NOT NULL,
+                scope_query TEXT NOT NULL
+            );
+            INSERT INTO tracker(singleton, locked_scope_query)
+            VALUES (1, 'deck:current');
+            INSERT INTO fresh_unsuspends(cid, nid, detected_at, scope_query)
+            VALUES (10, 1, '2026-06-01T12:00:00', 'deck:current');
+            PRAGMA user_version = 1;
+            """
+        )
+
+    initialize_storage(database_path, now=datetime(2026, 6, 15, 12))
+
+    assert get_retention_days() == 30
+    assert [event.cid for event in get_captured_events()] == [10]
+    with sqlite3.connect(database_path) as connection:
+        assert connection.execute("PRAGMA user_version").fetchone() == (2,)
+        assert connection.execute("SELECT retention_days FROM tracker").fetchone() == (
+            30,
+        )
 
 
 def test_loaded_locked_scope_is_tracking_even_if_old_state_was_disabled() -> None:

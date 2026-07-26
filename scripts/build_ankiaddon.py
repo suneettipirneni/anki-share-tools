@@ -16,6 +16,9 @@ EXCLUDED_NAMES = {
 EXCLUDED_SUFFIXES = {
     ".pyc",
     ".pyo",
+    ".sqlite3",
+    ".sqlite3-shm",
+    ".sqlite3-wal",
 }
 
 REQUIRED_NAMES = {
@@ -26,6 +29,7 @@ REQUIRED_NAMES = {
     "share_tools/browser_actions.py",
     "share_tools/browser_widget.py",
     "share_tools/queries.py",
+    "share_tools/tracker_database.py",
     "share_tools/unsuspend_tracker.py",
 }
 

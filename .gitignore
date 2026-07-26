@@ -9,6 +9,7 @@ wheels/
 .pytest_cache/
 .ruff_cache/
 addon/unsuspend_tracker_state.json
+addon/user_files/*.sqlite3*
 
 # Virtual environments
 .venv

@@ -1,6 +1,7 @@
 from pathlib import Path
 from typing import Any, Optional
 
+from anki.collection import OpChanges
 from aqt import gui_hooks, mw
 from aqt.browser import Browser
 from aqt.qt import (
@@ -37,22 +38,21 @@ from .queries import (
 )
 from .browser_widget import (
     attach_unsuspend_tracker_widget,
-    refresh_tracker_widgets_after_delay,
+    refresh_tracker_widgets,
     show_unsuspend_tracker_widget,
     sync_tracker_baseline_to_current_scope,
 )
 
 
 CLASS_TAG_PREFIX = "class::"
-_browser_suspend_wrapped = False
 _main_window_actions_registered = False
 
 
 def register_hooks() -> None:
-    wrap_browser_suspend_action()
     gui_hooks.main_window_did_init.append(register_main_window_actions)
     gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
     gui_hooks.browser_will_show.append(attach_unsuspend_tracker_widget)
+    gui_hooks.operation_did_execute.append(on_operation_did_execute)
 
 
 def register_main_window_actions() -> None:
@@ -78,27 +78,12 @@ def register_main_window_actions() -> None:
     _main_window_actions_registered = True
 
 
-def wrap_browser_suspend_action() -> None:
-    global _browser_suspend_wrapped
-
-    if _browser_suspend_wrapped:
-        return
-
-    original_suspend_selected_cards = getattr(Browser, "suspend_selected_cards", None)
-
-    if original_suspend_selected_cards is None:
-        return
-
-    def wrapped_suspend_selected_cards(browser: Browser, checked: bool) -> Any:
-        result = original_suspend_selected_cards(browser, checked)
-
-        if not checked:
-            refresh_tracker_widgets_after_delay()
-
-        return result
-
-    Browser.suspend_selected_cards = wrapped_suspend_selected_cards
-    _browser_suspend_wrapped = True
+def on_operation_did_execute(
+    changes: OpChanges,
+    _handler: Optional[object],
+) -> None:
+    if changes.card or changes.study_queues:
+        refresh_tracker_widgets()
 
 
 def on_browser_context_menu(browser: Browser, menu: QMenu) -> None:
