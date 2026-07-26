@@ -1,15 +1,20 @@
-name: Release
+name: Verify
 
 on:
   push:
-    tags:
-      - "*.*.*"
+    branches:
+      - main
+  pull_request:
 
 permissions:
-  contents: write
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  build-release:
+  verify:
     runs-on: ubuntu-latest
 
     steps:
@@ -33,11 +38,3 @@ jobs:
 
       - name: Test
         run: uv run pytest -q
-
-      - name: Build .ankiaddon
-        run: uv run python scripts/build_ankiaddon.py
-
-      - name: Create GitHub Release
-        uses: softprops/action-gh-release@v2
-        with:
-          files: dist/share_tools.ankiaddon

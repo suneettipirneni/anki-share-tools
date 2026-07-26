@@ -64,6 +64,7 @@ Run checks and build the distributable package from the repo root:
 uv sync --locked
 uv run ruff check .
 uv run pyright
+uv run pytest -q
 uv run python scripts/build_ankiaddon.py
 ```
 
