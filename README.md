@@ -20,6 +20,21 @@ Install the add-on from the packaged `.ankiaddon` file:
 6. Select the downloaded `share_tools.ankiaddon` file.
 7. Restart Anki.
 
+## Compatibility
+
+Share Tools supports Anki 2.1.50 and newer with Qt6. Qt5 builds are not
+supported. The current automated target is Anki 25.09.4.
+
+The minimum release uses Anki's embedded Python 3.9; Python is not a separate
+end-user compatibility promise. CI type-checks and runs the full unit suite
+against Anki/AQT 2.1.50 with Qt6 on Python 3.9, and lints, type-checks, tests,
+and builds against the locked Anki/AQT 25.09.4 target on Python 3.13.
+
+The packaged manifest declares the 2.1.50 floor. An older Anki release may
+unpack a locally installed archive, but Anki records it as incompatible and
+does not load or execute it. See [the compatibility matrix](docs/compatibility.md)
+for API evidence and the manual smoke checklist.
+
 ## What It Adds
 
 After restarting Anki, Share Tools adds a Browser panel for passive unsuspend tracking

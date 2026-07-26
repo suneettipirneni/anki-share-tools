@@ -8,8 +8,8 @@ dependencies = []
 
 [dependency-groups]
 dev = [
-    "anki>=25.9.4",
-    "aqt>=25.9.4",
+    "anki>=2.1.50",
+    "aqt>=2.1.50",
     "pyright>=1.1.407",
     "pytest>=8.0,<9",
     "ruff>=0.15.16",
