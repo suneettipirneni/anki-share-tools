@@ -37,6 +37,8 @@ from .queries import (
     normalize_tag_part,
 )
 from .browser_widget import (
+    deactivate_tracker_profile,
+    ensure_active_tracker_profile,
     attach_unsuspend_tracker_widget,
     refresh_tracker_widgets,
     show_unsuspend_tracker_widget,
@@ -53,6 +55,16 @@ def register_hooks() -> None:
     gui_hooks.browser_will_show_context_menu.append(on_browser_context_menu)
     gui_hooks.browser_will_show.append(attach_unsuspend_tracker_widget)
     gui_hooks.operation_did_execute.append(on_operation_did_execute)
+    gui_hooks.profile_did_open.append(on_profile_did_open)
+    gui_hooks.profile_will_close.append(on_profile_will_close)
+
+
+def on_profile_did_open() -> None:
+    ensure_active_tracker_profile()
+
+
+def on_profile_will_close() -> None:
+    deactivate_tracker_profile()
 
 
 def register_main_window_actions() -> None:

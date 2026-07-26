@@ -317,6 +317,7 @@ def initialize_storage(
 ) -> None:
     global _database
 
+    shutdown_storage(clear_runtime=True)
     database = TrackerDatabase(database_path)
     stored_state = database.load()
     _database = database
@@ -338,9 +339,12 @@ def initialize_storage(
     persist_state()
 
 
-def shutdown_storage() -> None:
+def shutdown_storage(*, clear_runtime: bool = False) -> None:
     global _database
     _database = None
+
+    if clear_runtime:
+        _clear_runtime_state()
 
 
 def persist_state() -> None:

@@ -1,6 +1,9 @@
 from datetime import datetime
+import hashlib
+import os
 from pathlib import Path
-from typing import Optional
+import tempfile
+from typing import Optional, Union
 from weakref import WeakSet
 
 from aqt import mw
@@ -34,12 +37,16 @@ from .ankipatch import (
     write_patch,
 )
 from . import unsuspend_tracker
+from .tracker_database import TrackerDatabase
 from .unsuspend_tracker import DateRange, FreshnessWindow
 
 
 ADDON_DIR = Path(__file__).resolve().parents[1]
-DATABASE_FILE = ADDON_DIR / "user_files" / "fresh_card_state.sqlite3"
+USER_FILES_DIR = ADDON_DIR / "user_files"
+LEGACY_DATABASE_FILE = USER_FILES_DIR / "fresh_card_state.sqlite3"
 LEGACY_STATE_FILE = ADDON_DIR / "unsuspend_tracker_state.json"
+PROFILE_DATABASE_NAME = "fresh_card_state.sqlite3"
+LEGACY_CLAIM_MARKER = USER_FILES_DIR / "profiles" / ".legacy-state-claimed"
 TIMER_INTERVAL_MS = 2000
 DOCK_ATTRIBUTE = "_share_tools_unsuspend_tracker_dock"
 CUSTOM_RANGE_VALUE = "custom"
@@ -50,7 +57,8 @@ RETENTION_OPTIONS = (
     ("1 year", 365),
     ("Forever", 0),
 )
-_state_loaded = False
+_active_profile_key: Optional[str] = None
+_active_database_path: Optional[Path] = None
 _widgets: WeakSet["UnsuspendTrackerWidget"] = WeakSet()
 
 
@@ -431,14 +439,14 @@ class UnsuspendTrackerWidget(QWidget):
 
 
 def attach_unsuspend_tracker_widget(browser: Browser) -> None:
-    load_tracker_state_once()
+    ensure_active_tracker_profile()
     ensure_default_scope_locked()
 
     ensure_unsuspend_tracker_dock(browser, show=False)
 
 
 def show_unsuspend_tracker_widget(browser: Browser) -> None:
-    load_tracker_state_once()
+    ensure_active_tracker_profile()
     ensure_default_scope_locked()
     ensure_unsuspend_tracker_dock(browser, show=True)
 
@@ -449,6 +457,8 @@ def ensure_unsuspend_tracker_dock(browser: Browser, show: bool) -> None:
     if dock is not None and is_widget_alive(dock):
         widget = dock.widget()
         if isinstance(widget, UnsuspendTrackerWidget):
+            _widgets.add(widget)
+            widget.timer.start()
             widget.update_view()
         if show:
             dock.show()
@@ -619,11 +629,123 @@ def default_ankipatch_filename_for_date_range(date_range: DateRange) -> str:
     )
 
 
-def load_tracker_state_once() -> None:
-    global _state_loaded
+def profile_key_for_collection_path(collection_path: Union[str, Path]) -> str:
+    normalized_path = os.path.abspath(os.fspath(collection_path))
+    return hashlib.sha256(os.fsencode(normalized_path)).hexdigest()
 
-    if _state_loaded:
-        return
 
-    unsuspend_tracker.initialize_storage(DATABASE_FILE, LEGACY_STATE_FILE)
-    _state_loaded = True
+def profile_database_path(profile_key: str) -> Path:
+    return USER_FILES_DIR / "profiles" / profile_key / PROFILE_DATABASE_NAME
+
+
+def get_active_profile_key() -> Optional[str]:
+    return _active_profile_key
+
+
+def activate_tracker_profile(collection_path: Union[str, Path]) -> Path:
+    global _active_database_path, _active_profile_key
+
+    profile_key = profile_key_for_collection_path(collection_path)
+    database_path = profile_database_path(profile_key)
+
+    if (
+        _active_profile_key == profile_key
+        and _active_database_path == database_path
+    ):
+        return database_path
+
+    deactivate_tracker_profile()
+    legacy_json_path = _claim_legacy_state(database_path, profile_key)
+    unsuspend_tracker.initialize_storage(database_path, legacy_json_path)
+    _active_profile_key = profile_key
+    _active_database_path = database_path
+
+    if legacy_json_path is not None:
+        _write_legacy_claim_marker(profile_key)
+
+    return database_path
+
+
+def ensure_active_tracker_profile() -> Path:
+    collection = getattr(mw, "col", None)
+    collection_path = getattr(collection, "path", None)
+
+    if collection_path is None:
+        raise RuntimeError("Open an Anki profile before using the fresh-card tracker.")
+
+    return activate_tracker_profile(collection_path)
+
+
+def deactivate_tracker_profile() -> None:
+    global _active_database_path, _active_profile_key
+
+    stop_tracker_widgets()
+    unsuspend_tracker.shutdown_storage(clear_runtime=True)
+    _active_profile_key = None
+    _active_database_path = None
+
+
+def stop_tracker_widgets() -> None:
+    for widget in list(_widgets):
+        unregister_tracker_widget(widget)
+    _widgets.clear()
+
+
+def _claim_legacy_state(
+    database_path: Path,
+    profile_key: str,
+) -> Optional[Path]:
+    if LEGACY_CLAIM_MARKER.exists():
+        return None
+
+    if database_path.exists():
+        _write_legacy_claim_marker(profile_key)
+        return None
+
+    if LEGACY_DATABASE_FILE.exists():
+        source_state = TrackerDatabase(LEGACY_DATABASE_FILE).load()
+
+        if source_state is None:
+            _write_legacy_claim_marker(profile_key)
+            return None
+
+        database_path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Optional[Path] = None
+
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=database_path.parent,
+                prefix=f".{PROFILE_DATABASE_NAME}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary_file:
+                temporary_path = Path(temporary_file.name)
+
+            destination = TrackerDatabase(temporary_path)
+            destination.save(source_state)
+
+            if destination.load() != source_state:
+                raise RuntimeError(
+                    "Legacy fresh-card state failed its migration round trip."
+                )
+
+            temporary_path.replace(database_path)
+            temporary_path = None
+            _write_legacy_claim_marker(profile_key)
+        finally:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+
+        return None
+
+    if LEGACY_STATE_FILE.exists():
+        return LEGACY_STATE_FILE
+
+    return None
+
+
+def _write_legacy_claim_marker(profile_key: str) -> None:
+    LEGACY_CLAIM_MARKER.parent.mkdir(parents=True, exist_ok=True)
+    temporary_marker = LEGACY_CLAIM_MARKER.with_suffix(".tmp")
+    temporary_marker.write_text(f"{profile_key}\n", encoding="ascii")
+    temporary_marker.replace(LEGACY_CLAIM_MARKER)
