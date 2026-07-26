@@ -1,6 +1,10 @@
+from pathlib import Path
+from types import SimpleNamespace
+
 import pytest
 
 from anki.collection import OpChanges
+from share_tools import ankipatch, browser_actions
 from share_tools.ankipatch import (
     AnkiPatch,
     CardPatchRow,
@@ -9,6 +13,7 @@ from share_tools.ankipatch import (
     format_apply_report,
     parse_patch_text,
     preview_patch_against_collection,
+    read_patch,
     serialize_patch,
 )
 
@@ -122,6 +127,164 @@ def test_serialize_and_parse_patch_round_trips_rows() -> None:
         ],
         created_at="2026-06-23T12:00:00+00:00",
     )
+
+
+@pytest.mark.parametrize("size", [4, 5])
+def test_read_patch_accepts_files_at_or_below_byte_limit(
+    tmp_path: Path,
+    monkeypatch,
+    size: int,
+) -> None:
+    path = tmp_path / "bounded.ankipatch"
+    path.write_text("a" * size, encoding="utf-8")
+    monkeypatch.setattr(ankipatch, "MAX_ANKIPATCH_BYTES", 5)
+    monkeypatch.setattr(
+        ankipatch,
+        "parse_patch_text",
+        lambda text: AnkiPatch(cards=[], created_at=text),
+    )
+
+    patch = read_patch(path)
+
+    assert patch.created_at == "a" * size
+
+
+def test_read_patch_rejects_file_above_byte_limit_before_parsing(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "oversized.ankipatch"
+    path.write_text("a" * 6, encoding="utf-8")
+    parse_calls = 0
+    monkeypatch.setattr(ankipatch, "MAX_ANKIPATCH_BYTES", 5)
+
+    def parse_patch(_text: str) -> AnkiPatch:
+        nonlocal parse_calls
+        parse_calls += 1
+        return AnkiPatch(cards=[])
+
+    monkeypatch.setattr(ankipatch, "parse_patch_text", parse_patch)
+
+    with pytest.raises(
+        ValueError,
+        match=r"5-byte limit \(observed 6 bytes\)",
+    ):
+        read_patch(path)
+
+    assert parse_calls == 0
+
+
+def test_read_patch_rechecks_multibyte_content_after_read(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    path = tmp_path / "growing.ankipatch"
+    path.write_text("éé", encoding="utf-8")
+    original_stat = Path.stat
+    monkeypatch.setattr(ankipatch, "MAX_ANKIPATCH_BYTES", 3)
+
+    def underreported_stat(self: Path, *args, **kwargs):
+        if self == path:
+            return SimpleNamespace(st_size=2)
+        return original_stat(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "stat", underreported_stat)
+
+    with pytest.raises(
+        ValueError,
+        match=r"3-byte limit \(observed 4 bytes\)",
+    ):
+        read_patch(path)
+
+
+def test_parse_accepts_rows_at_limit(monkeypatch) -> None:
+    monkeypatch.setattr(ankipatch, "MAX_ANKIPATCH_ROWS", 2)
+    text = serialize_patch(
+        AnkiPatch(
+            cards=[
+                CardPatchRow("guid-a", 0, False),
+                CardPatchRow("guid-b", 0, True),
+            ]
+        )
+    )
+
+    parsed = parse_patch_text(text)
+
+    assert len(parsed.cards) == 2
+
+
+def test_parse_rejects_rows_above_limit_before_row_construction(monkeypatch) -> None:
+    text = serialize_patch(
+        AnkiPatch(
+            cards=[
+                CardPatchRow("guid-a", 0, False),
+                CardPatchRow("guid-b", 0, True),
+                CardPatchRow("guid-c", 0, False),
+            ]
+        )
+    )
+    parse_calls = 0
+    monkeypatch.setattr(ankipatch, "MAX_ANKIPATCH_ROWS", 2)
+
+    def parse_card_row(_raw_card, _index):
+        nonlocal parse_calls
+        parse_calls += 1
+        raise AssertionError("row construction should not start")
+
+    monkeypatch.setattr(ankipatch, "parse_card_row", parse_card_row)
+
+    with pytest.raises(
+        ValueError,
+        match=r"2-row limit \(observed 3 rows\)",
+    ):
+        parse_patch_text(text)
+
+    assert parse_calls == 0
+
+
+def test_malformed_json_error_is_unchanged() -> None:
+    with pytest.raises(ValueError, match="Invalid ankipatch JSON"):
+        parse_patch_text("{")
+
+
+def test_oversized_file_message_stops_before_preview(monkeypatch) -> None:
+    messages: list[str] = []
+    preview_calls = 0
+    monkeypatch.setattr(browser_actions, "mw", SimpleNamespace(col=object()))
+    monkeypatch.setattr(
+        browser_actions.QFileDialog,
+        "getOpenFileName",
+        lambda *_args: ("oversized.ankipatch", ""),
+    )
+
+    def read_oversized_patch(_path):
+        raise ValueError(
+            "Ankipatch file exceeds the 10,485,760-byte limit "
+            "(observed 10,485,761 bytes)."
+        )
+
+    monkeypatch.setattr(browser_actions, "read_patch", read_oversized_patch)
+
+    def preview_patch(_col, _patch):
+        nonlocal preview_calls
+        preview_calls += 1
+        return []
+
+    monkeypatch.setattr(
+        browser_actions,
+        "preview_patch_against_collection",
+        preview_patch,
+    )
+    monkeypatch.setattr(browser_actions, "showInfo", messages.append)
+
+    browser_actions.apply_ankipatch_from_file(object())
+
+    assert messages == [
+        "Could not read ankipatch:\n\n"
+        "Ankipatch file exceeds the 10,485,760-byte limit "
+        "(observed 10,485,761 bytes)."
+    ]
+    assert preview_calls == 0
 
 
 def test_parse_rejects_conflicting_duplicate_rows() -> None:

@@ -11,6 +11,10 @@ FORMAT_NAME = "anki-share-tools/ankipatch"
 FORMAT_VERSION = 1
 ANKIPATCH_SUFFIX = ".ankipatch"
 SUSPENDED_QUEUE = -1
+# These bounds keep a user-selected interchange file small enough to validate and
+# review in memory without turning the Anki UI workflow into an unbounded workload.
+MAX_ANKIPATCH_BYTES = 10 * 1024 * 1024
+MAX_ANKIPATCH_ROWS = 50_000
 
 
 @dataclass(frozen=True)
@@ -98,6 +102,12 @@ def parse_patch_text(text: str) -> AnkiPatch:
     raw_cards = payload.get("cards")
     if not isinstance(raw_cards, list):
         raise ValueError("Invalid ankipatch: cards must be a list.")
+    if len(raw_cards) > MAX_ANKIPATCH_ROWS:
+        raise ValueError(
+            "Invalid ankipatch: cards exceed the "
+            f"{MAX_ANKIPATCH_ROWS:,}-row limit "
+            f"(observed {len(raw_cards):,} rows)."
+        )
 
     rows = [parse_card_row(raw_card, index) for index, raw_card in enumerate(raw_cards)]
     return AnkiPatch(
@@ -106,7 +116,20 @@ def parse_patch_text(text: str) -> AnkiPatch:
 
 
 def read_patch(path: Path) -> AnkiPatch:
-    return parse_patch_text(path.read_text(encoding="utf-8"))
+    file_size = path.stat().st_size
+    enforce_patch_byte_limit(file_size)
+    text = path.read_text(encoding="utf-8")
+    enforce_patch_byte_limit(len(text.encode("utf-8")))
+    return parse_patch_text(text)
+
+
+def enforce_patch_byte_limit(observed_bytes: int) -> None:
+    if observed_bytes > MAX_ANKIPATCH_BYTES:
+        raise ValueError(
+            "Ankipatch file exceeds the "
+            f"{MAX_ANKIPATCH_BYTES:,}-byte limit "
+            f"(observed {observed_bytes:,} bytes)."
+        )
 
 
 def write_patch(path: Path, patch: AnkiPatch) -> None:
