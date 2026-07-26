@@ -97,6 +97,7 @@ def record_snapshot(
     current_suspended_cids: Iterable[int],
     cid_to_nid: Callable[[int], Optional[int]],
     now: Optional[datetime] = None,
+    current_in_scope_cids: Optional[Iterable[int]] = None,
 ) -> list[UnsuspendEvent]:
     if not _tracking_enabled or _locked_scope_query is None:
         return []
@@ -104,6 +105,12 @@ def record_snapshot(
     detected_at = now or datetime.now()
     current_suspended = {int(cid) for cid in current_suspended_cids}
     previous_suspended = set(_previous_suspended_cids)
+    current_in_scope = (
+        {int(cid) for cid in current_in_scope_cids}
+        if current_in_scope_cids is not None
+        else previous_suspended | current_suspended
+    )
+    current_suspended &= current_in_scope
     cutoff_date = retention_cutoff_date(_retention_days, detected_at.date())
     expired_event_cids = {
         event.cid
@@ -113,7 +120,9 @@ def record_snapshot(
     removed_event_cids = (
         current_suspended & _captured_events_by_cid.keys()
     ) | expired_event_cids
-    newly_unsuspended = sorted(previous_suspended - current_suspended)
+    newly_unsuspended = sorted(
+        (previous_suspended - current_suspended) & current_in_scope
+    )
     new_events: list[UnsuspendEvent] = []
 
     for cid in newly_unsuspended:

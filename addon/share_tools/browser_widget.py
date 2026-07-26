@@ -378,10 +378,12 @@ class UnsuspendTrackerWidget(QWidget):
 
         try:
             scope_query = unsuspend_tracker.get_locked_scope_query() or ""
+            current_in_scope_cids = find_cids_in_scope(scope_query)
             current_suspended_cids = find_suspended_cids_in_scope(scope_query)
             unsuspend_tracker.record_snapshot(
                 current_suspended_cids=current_suspended_cids,
                 cid_to_nid=cid_to_nid,
+                current_in_scope_cids=current_in_scope_cids,
             )
         except Exception as exc:
             if show_errors:
@@ -564,6 +566,15 @@ def build_suspended_scope_query(scope_query: str) -> str:
         return "is:suspended"
 
     return f"({scope_query}) is:suspended"
+
+
+def build_scope_membership_query(scope_query: str) -> str:
+    return scope_query.strip()
+
+
+def find_cids_in_scope(scope_query: str) -> list[int]:
+    query = build_scope_membership_query(scope_query)
+    return sorted(int(cid) for cid in mw.col.find_cards(query))
 
 
 def find_suspended_cids_in_scope(scope_query: str) -> list[int]:

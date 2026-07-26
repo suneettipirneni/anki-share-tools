@@ -186,6 +186,106 @@ def test_resolver_failure_does_not_partially_advance_snapshot(tmp_path) -> None:
     ]
 
 
+def test_snapshot_classifies_suspension_scope_and_entry_independently() -> None:
+    now = datetime(2026, 6, 15, 10)
+    resolved_cids: list[int] = []
+
+    def resolve_card(cid: int) -> int:
+        resolved_cids.append(cid)
+        return cid // 10
+
+    lock_scope("tag:class::cardiology", [10, 20, 30])
+
+    assert record_snapshot(
+        current_in_scope_cids=[10, 20, 40],
+        current_suspended_cids=[10, 40],
+        cid_to_nid=resolve_card,
+        now=now,
+    ) == [
+        UnsuspendEvent(
+            cid=20,
+            nid=2,
+            detected_at=now,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+    assert resolved_cids == [20]
+
+    assert record_snapshot(
+        current_in_scope_cids=[10, 40],
+        current_suspended_cids=[10, 40],
+        cid_to_nid=resolve_card,
+        now=now,
+    ) == []
+    assert resolved_cids == [20]
+
+    later = datetime(2026, 6, 15, 11)
+    assert record_snapshot(
+        current_in_scope_cids=[10, 40],
+        current_suspended_cids=[40],
+        cid_to_nid=resolve_card,
+        now=later,
+    ) == [
+        UnsuspendEvent(
+            cid=10,
+            nid=1,
+            detected_at=later,
+            scope_query="tag:class::cardiology",
+        )
+    ]
+    assert [event.cid for event in get_captured_events()] == [20, 10]
+
+
+def test_scope_departure_with_missing_card_is_pruned_without_resolution() -> None:
+    lock_scope("tag:class::cardiology", [10])
+
+    def unexpected_resolver_call(_cid: int) -> None:
+        raise AssertionError("out-of-scope card should not be resolved")
+
+    assert record_snapshot(
+        current_in_scope_cids=[],
+        current_suspended_cids=[],
+        cid_to_nid=unexpected_resolver_call,
+    ) == []
+
+
+def test_snapshot_database_failure_leaves_runtime_baseline_unchanged(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    initialize_storage(database_path)
+    lock_scope("tag:class::cardiology", [10, 20])
+
+    def fail_snapshot(*_args, **_kwargs) -> None:
+        raise OSError("database unavailable")
+
+    monkeypatch.setattr(
+        "share_tools.unsuspend_tracker._database.apply_snapshot",
+        fail_snapshot,
+    )
+
+    with pytest.raises(OSError, match="database unavailable"):
+        record_snapshot(
+            current_in_scope_cids=[10, 20],
+            current_suspended_cids=[20],
+            cid_to_nid=cid_to_nid,
+        )
+
+    shutdown_storage()
+    clear_all()
+    initialize_storage(database_path)
+    now = datetime(2026, 6, 15, 10)
+    assert record_snapshot(
+        current_in_scope_cids=[10, 20],
+        current_suspended_cids=[20],
+        cid_to_nid=cid_to_nid,
+        now=now,
+    ) == [
+        UnsuspendEvent(10, 1, now, "tag:class::cardiology")
+    ]
+
+
 def test_duplicate_snapshots_do_not_duplicate_events() -> None:
     lock_scope("tag:class::cardiology", [10, 20])
 

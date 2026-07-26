@@ -1,17 +1,21 @@
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Iterator
 
 import pytest
 
+from share_tools import browser_widget
 from share_tools.browser_widget import (
     RETENTION_OPTIONS,
     activate_tracker_profile,
+    build_scope_membership_query,
     build_suspended_scope_query,
     deactivate_tracker_profile,
     default_ankipatch_filename,
     default_ankipatch_filename_for_date_range,
     default_share_tag_for_window,
+    find_cids_in_scope,
     get_active_profile_key,
     normalize_scope_query,
     profile_key_for_collection_path,
@@ -212,6 +216,36 @@ def test_build_suspended_scope_query_wraps_non_empty_scope() -> None:
 
 def test_build_suspended_scope_query_handles_empty_scope() -> None:
     assert build_suspended_scope_query("") == "is:suspended"
+
+
+def test_build_scope_membership_query_preserves_nonempty_scope() -> None:
+    assert (
+        build_scope_membership_query("  tag:class::cardiology  ")
+        == "tag:class::cardiology"
+    )
+
+
+def test_build_scope_membership_query_uses_empty_all_cards_search() -> None:
+    assert build_scope_membership_query("") == ""
+
+
+def test_find_cids_in_empty_scope_uses_supported_all_cards_query(
+    monkeypatch,
+) -> None:
+    queries: list[str] = []
+
+    def find_cards(query: str) -> list[int]:
+        queries.append(query)
+        return [30, 10]
+
+    monkeypatch.setattr(
+        browser_widget,
+        "mw",
+        SimpleNamespace(col=SimpleNamespace(find_cards=find_cards)),
+    )
+
+    assert find_cids_in_scope("") == [10, 30]
+    assert queries == [""]
 
 
 def test_default_share_tag_for_today(monkeypatch) -> None:
