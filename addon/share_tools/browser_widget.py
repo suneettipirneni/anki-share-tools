@@ -29,7 +29,7 @@ from aqt.qt import (
     Qt,
     sip,
 )
-from aqt.utils import askUser, showInfo, tooltip
+from aqt.utils import askUser, openFolder, showInfo, tooltip
 
 from .ankipatch import (
     AnkiPatch,
@@ -38,7 +38,11 @@ from .ankipatch import (
     write_patch,
 )
 from . import unsuspend_tracker
-from .tracker_database import TrackerDatabase
+from .tracker_database import (
+    TrackerDatabase,
+    TrackerMigrationError,
+    TrackerStorageError,
+)
 from .unsuspend_tracker import DateRange, FreshnessWindow
 
 
@@ -60,6 +64,8 @@ RETENTION_OPTIONS = (
 )
 _active_profile_key: Optional[str] = None
 _active_database_path: Optional[Path] = None
+_storage_error: Optional[Union[TrackerMigrationError, TrackerStorageError]] = None
+_storage_failure_notified = False
 _widgets: WeakSet["UnsuspendTrackerWidget"] = WeakSet()
 
 
@@ -75,6 +81,8 @@ class UnsuspendTrackerWidget(QWidget):
         self.scope_label = QLabel(self)
         self.scope_label.setWordWrap(True)
         self.count_label = QLabel(self)
+        self.storage_health_label = QLabel(self)
+        self.storage_health_label.setWordWrap(True)
         self.retention_combo = QComboBox(self)
         for label, retention_days in RETENTION_OPTIONS:
             self.retention_combo.addItem(label, retention_days)
@@ -139,16 +147,24 @@ class UnsuspendTrackerWidget(QWidget):
 
         self.clear_button = QPushButton("Clear captured", self)
         self.clear_button.clicked.connect(self.clear_captured)
+        self.retry_storage_button = QPushButton("Retry tracker storage", self)
+        self.retry_storage_button.clicked.connect(self.retry_storage)
+        self.open_data_folder_button = QPushButton("Open tracker data folder", self)
+        self.open_data_folder_button.clicked.connect(open_tracker_data_folder)
+        self.start_fresh_button = QPushButton("Start fresh tracker storage", self)
+        self.start_fresh_button.clicked.connect(self.start_fresh_storage)
         self.destroyed.connect(lambda: unregister_tracker_widget(self))
 
         self.setup_layout()
         self.update_view()
-        self.timer.start()
+        if is_tracker_storage_healthy():
+            self.timer.start()
 
     def setup_layout(self) -> None:
         layout = QVBoxLayout()
         layout.addWidget(self.tracking_label)
         layout.addWidget(self.scope_label)
+        layout.addWidget(self.storage_health_label)
 
         retention_layout = QHBoxLayout()
         retention_layout.addWidget(QLabel("Keep fresh unsuspends for:", self))
@@ -174,6 +190,9 @@ class UnsuspendTrackerWidget(QWidget):
         layout.addWidget(self.export_patch_button)
         layout.addWidget(self.apply_patch_button)
         layout.addWidget(self.clear_button)
+        layout.addWidget(self.retry_storage_button)
+        layout.addWidget(self.open_data_folder_button)
+        layout.addWidget(self.start_fresh_button)
         layout.addStretch(1)
         self.setLayout(layout)
 
@@ -260,6 +279,25 @@ class UnsuspendTrackerWidget(QWidget):
             return
 
         self.sync_retention_combo()
+        storage_healthy = is_tracker_storage_healthy()
+        self.storage_health_label.setVisible(not storage_healthy)
+        self.storage_health_label.setText(storage_health_message())
+        for control in (
+            self.retention_combo,
+            self.events_table,
+            self.lock_button,
+            self.refresh_button,
+            self.export_patch_button,
+            self.apply_patch_button,
+            self.clear_button,
+        ):
+            control.setEnabled(storage_healthy)
+        for control in (
+            self.retry_storage_button,
+            self.open_data_folder_button,
+            self.start_fresh_button,
+        ):
+            control.setVisible(not storage_healthy)
 
         today = QDate.currentDate()
         self.from_date_edit.setMaximumDate(today)
@@ -369,6 +407,10 @@ class UnsuspendTrackerWidget(QWidget):
         if not is_widget_alive(self):
             return
 
+        if not is_tracker_storage_healthy():
+            self.update_view()
+            return
+
         if (
             not unsuspend_tracker.is_tracking_enabled()
             or unsuspend_tracker.get_locked_scope_query() is None
@@ -440,17 +482,31 @@ class UnsuspendTrackerWidget(QWidget):
         unsuspend_tracker.clear_captured()
         self.update_view()
 
+    def retry_storage(self) -> None:
+        retry_tracker_storage()
+        self.update_view()
+
+    def start_fresh_storage(self) -> None:
+        if not askUser(
+            "Rename the failed tracker database as a backup and start fresh?"
+        ):
+            return
+        start_fresh_tracker_storage()
+        self.update_view()
+
 
 def attach_unsuspend_tracker_widget(browser: Browser) -> None:
     ensure_active_tracker_profile()
-    ensure_default_scope_locked()
+    if is_tracker_storage_healthy():
+        ensure_default_scope_locked()
 
     ensure_unsuspend_tracker_dock(browser, show=False)
 
 
 def show_unsuspend_tracker_widget(browser: Browser) -> None:
     ensure_active_tracker_profile()
-    ensure_default_scope_locked()
+    if is_tracker_storage_healthy():
+        ensure_default_scope_locked()
     ensure_unsuspend_tracker_dock(browser, show=True)
 
 
@@ -461,7 +517,8 @@ def ensure_unsuspend_tracker_dock(browser: Browser, show: bool) -> None:
         widget = dock.widget()
         if isinstance(widget, UnsuspendTrackerWidget):
             _widgets.add(widget)
-            widget.timer.start()
+            if is_tracker_storage_healthy():
+                widget.timer.start()
             widget.update_view()
         if show:
             dock.show()
@@ -490,6 +547,9 @@ def ensure_default_scope_locked() -> None:
 
 
 def sync_tracker_baseline_to_current_scope() -> None:
+    if not is_tracker_storage_healthy():
+        return
+
     if (
         not unsuspend_tracker.is_tracking_enabled()
         or unsuspend_tracker.get_locked_scope_query() is None
@@ -657,8 +717,13 @@ def get_active_profile_key() -> Optional[str]:
     return _active_profile_key
 
 
-def activate_tracker_profile(collection_path: Union[str, Path]) -> Path:
+def activate_tracker_profile(
+    collection_path: Union[str, Path],
+    *,
+    force_retry: bool = False,
+) -> Path:
     global _active_database_path, _active_profile_key
+    global _storage_error, _storage_failure_notified
 
     profile_key = profile_key_for_collection_path(collection_path)
     database_path = profile_database_path(profile_key)
@@ -666,17 +731,44 @@ def activate_tracker_profile(collection_path: Union[str, Path]) -> Path:
     if (
         _active_profile_key == profile_key
         and _active_database_path == database_path
+        and not force_retry
     ):
         return database_path
 
-    deactivate_tracker_profile()
-    legacy_json_path = _claim_legacy_state(database_path, profile_key)
-    unsuspend_tracker.initialize_storage(database_path, legacy_json_path)
+    if force_retry:
+        unsuspend_tracker.shutdown_storage(clear_runtime=True)
+        _storage_error = None
+    else:
+        deactivate_tracker_profile()
+
     _active_profile_key = profile_key
     _active_database_path = database_path
 
-    if legacy_json_path is not None:
-        _write_legacy_claim_marker(profile_key)
+    try:
+        legacy_json_path = _claim_legacy_state(database_path, profile_key)
+        unsuspend_tracker.initialize_storage(database_path, legacy_json_path)
+        if legacy_json_path is not None:
+            _write_legacy_claim_marker(profile_key)
+    except (TrackerMigrationError, TrackerStorageError) as exc:
+        unsuspend_tracker.shutdown_storage(clear_runtime=True)
+        _storage_error = exc
+        if not _storage_failure_notified:
+            showInfo(storage_health_message())
+            _storage_failure_notified = True
+        refresh_tracker_widget_views()
+        return database_path
+    except Exception:
+        unsuspend_tracker.shutdown_storage(clear_runtime=True)
+        _active_profile_key = None
+        _active_database_path = None
+        raise
+
+    _storage_error = None
+    _storage_failure_notified = False
+    for widget in list(_widgets):
+        if is_widget_alive(widget.timer):
+            widget.timer.start()
+    refresh_tracker_widget_views()
 
     return database_path
 
@@ -693,11 +785,73 @@ def ensure_active_tracker_profile() -> Path:
 
 def deactivate_tracker_profile() -> None:
     global _active_database_path, _active_profile_key
+    global _storage_error, _storage_failure_notified
 
     stop_tracker_widgets()
     unsuspend_tracker.shutdown_storage(clear_runtime=True)
     _active_profile_key = None
     _active_database_path = None
+    _storage_error = None
+    _storage_failure_notified = False
+
+
+def is_tracker_storage_healthy() -> bool:
+    return _storage_error is None
+
+
+def storage_health_message() -> str:
+    if _storage_error is None:
+        return ""
+    return (
+        "Fresh-card tracker storage is unavailable "
+        f"({_storage_error.category}). Tracking controls are read-only until "
+        "you retry or start fresh."
+    )
+
+
+def retry_tracker_storage() -> bool:
+    collection = getattr(mw, "col", None)
+    collection_path = getattr(collection, "path", None)
+    if collection_path is None:
+        return False
+    activate_tracker_profile(collection_path, force_retry=True)
+    return is_tracker_storage_healthy()
+
+
+def open_tracker_data_folder() -> None:
+    if _active_database_path is not None:
+        openFolder(str(_active_database_path.parent))
+
+
+def backup_failed_tracker_database(
+    database_path: Path,
+    now: Optional[datetime] = None,
+) -> Optional[Path]:
+    if not database_path.exists():
+        return None
+    timestamp = (now or datetime.now()).strftime("%Y%m%d-%H%M%S")
+    backup_path = database_path.with_name(f"{database_path.name}.failed-{timestamp}")
+    suffix = 1
+    while backup_path.exists():
+        backup_path = database_path.with_name(
+            f"{database_path.name}.failed-{timestamp}-{suffix}"
+        )
+        suffix += 1
+    database_path.replace(backup_path)
+    return backup_path
+
+
+def start_fresh_tracker_storage(
+    confirmed: bool = True,
+    now: Optional[datetime] = None,
+) -> Optional[Path]:
+    if not confirmed or _active_database_path is None:
+        return None
+    backup_path = backup_failed_tracker_database(_active_database_path, now)
+    if _active_profile_key is not None and not LEGACY_CLAIM_MARKER.exists():
+        _write_legacy_claim_marker(_active_profile_key)
+    retry_tracker_storage()
+    return backup_path
 
 
 def stop_tracker_widgets() -> None:

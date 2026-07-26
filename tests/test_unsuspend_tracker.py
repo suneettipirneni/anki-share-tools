@@ -841,6 +841,113 @@ def test_failed_migration_quarantines_preexisting_empty_destination(
     assert legacy_path.read_bytes() == original_bytes
 
 
+def configure_browser_tracker_storage(monkeypatch, tmp_path: Path) -> None:
+    user_files_dir = tmp_path / "user_files"
+    monkeypatch.setattr(browser_widget, "USER_FILES_DIR", user_files_dir)
+    monkeypatch.setattr(
+        browser_widget,
+        "LEGACY_DATABASE_FILE",
+        user_files_dir / "fresh_card_state.sqlite3",
+    )
+    monkeypatch.setattr(
+        browser_widget,
+        "LEGACY_STATE_FILE",
+        tmp_path / "unsuspend_tracker_state.json",
+    )
+    monkeypatch.setattr(
+        browser_widget,
+        "LEGACY_CLAIM_MARKER",
+        user_files_dir / "profiles" / ".legacy-state-claimed",
+    )
+
+
+def test_profile_storage_failure_is_contained_and_not_retried_on_attach(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    browser_widget.deactivate_tracker_profile()
+    configure_browser_tracker_storage(monkeypatch, tmp_path)
+    profile_path = tmp_path / "Profile A" / "collection.anki2"
+    profile_key = browser_widget.profile_key_for_collection_path(profile_path)
+    database_path = browser_widget.profile_database_path(profile_key)
+    database_path.parent.mkdir(parents=True)
+    database_path.write_bytes(b"not a sqlite database")
+    notifications: list[str] = []
+    monkeypatch.setattr(browser_widget, "showInfo", notifications.append)
+
+    browser_widget.activate_tracker_profile(profile_path)
+
+    assert not browser_widget.is_tracker_storage_healthy()
+    assert not is_tracking_enabled()
+    assert get_locked_scope_query() is None
+    assert len(notifications) == 1
+
+    browser_widget.activate_tracker_profile(profile_path)
+    assert len(notifications) == 1
+    assert database_path.read_bytes() == b"not a sqlite database"
+
+    browser_widget.deactivate_tracker_profile()
+    browser_widget.activate_tracker_profile(profile_path)
+    assert len(notifications) == 2
+    browser_widget.deactivate_tracker_profile()
+
+
+def test_start_fresh_requires_confirmation_and_backs_up_failed_database(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    browser_widget.deactivate_tracker_profile()
+    configure_browser_tracker_storage(monkeypatch, tmp_path)
+    profile_path = tmp_path / "Profile A" / "collection.anki2"
+    monkeypatch.setattr(
+        browser_widget,
+        "mw",
+        SimpleNamespace(col=SimpleNamespace(path=str(profile_path))),
+    )
+    monkeypatch.setattr(browser_widget, "showInfo", lambda _message: None)
+    profile_key = browser_widget.profile_key_for_collection_path(profile_path)
+    database_path = browser_widget.profile_database_path(profile_key)
+    database_path.parent.mkdir(parents=True)
+    failed_contents = b"failed database bytes"
+    database_path.write_bytes(failed_contents)
+    browser_widget.activate_tracker_profile(profile_path)
+    now = datetime(2026, 7, 26, 12, 30)
+
+    assert browser_widget.start_fresh_tracker_storage(False, now) is None
+    assert database_path.read_bytes() == failed_contents
+
+    backup_path = browser_widget.start_fresh_tracker_storage(True, now)
+
+    assert backup_path is not None
+    assert backup_path.name.endswith(".failed-20260726-123000")
+    assert backup_path.read_bytes() == failed_contents
+    assert browser_widget.is_tracker_storage_healthy()
+    assert TrackerDatabase(database_path).load() == StoredTrackerState(
+        None,
+        (),
+        (),
+        30,
+    )
+    browser_widget.deactivate_tracker_profile()
+
+
+def test_open_tracker_data_folder_uses_anki_helper(monkeypatch, tmp_path) -> None:
+    browser_widget.deactivate_tracker_profile()
+    configure_browser_tracker_storage(monkeypatch, tmp_path)
+    profile_path = tmp_path / "Profile A" / "collection.anki2"
+    opened_paths: list[str] = []
+    monkeypatch.setattr(browser_widget, "openFolder", opened_paths.append)
+    browser_widget.activate_tracker_profile(profile_path)
+
+    browser_widget.open_tracker_data_folder()
+
+    database_path = browser_widget.profile_database_path(
+        browser_widget.profile_key_for_collection_path(profile_path)
+    )
+    assert opened_paths == [str(database_path.parent)]
+    browser_widget.deactivate_tracker_profile()
+
+
 def test_retention_setting_and_sweep_persist_across_restarts(tmp_path) -> None:
     database_path = tmp_path / "tracker.sqlite3"
 

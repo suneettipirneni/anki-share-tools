@@ -1,13 +1,40 @@
-from contextlib import closing
+from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 import sqlite3
-from typing import Optional
+from typing import Iterator, Optional
 
 
 SCHEMA_VERSION = 2
 DEFAULT_RETENTION_DAYS = 30
+EXPECTED_V1_COLUMNS = {
+    "tracker": (
+        ("singleton", "INTEGER", 0, 1),
+        ("locked_scope_query", "TEXT", 0, 0),
+    ),
+    "suspended_baseline": (("cid", "INTEGER", 0, 1),),
+    "fresh_unsuspends": (
+        ("cid", "INTEGER", 0, 1),
+        ("nid", "INTEGER", 1, 0),
+        ("detected_at", "TEXT", 1, 0),
+        ("scope_query", "TEXT", 1, 0),
+    ),
+}
+EXPECTED_V2_COLUMNS = {
+    **EXPECTED_V1_COLUMNS,
+    "tracker": (
+        *EXPECTED_V1_COLUMNS["tracker"],
+        ("retention_days", "INTEGER", 1, 0),
+    ),
+}
+
+
+class TrackerStorageError(RuntimeError):
+    def __init__(self, category: str, path: Path) -> None:
+        self.category = category
+        self.path = path
+        super().__init__(f"Tracker storage unavailable ({category}): {path}")
 
 
 class TrackerMigrationError(RuntimeError):
@@ -58,18 +85,20 @@ class TrackerDatabase:
         if self._initialized:
             return
 
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            raise TrackerStorageError("database", self.path) from exc
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             version = int(connection.execute("PRAGMA user_version").fetchone()[0])
 
             if version > SCHEMA_VERSION:
-                raise RuntimeError(
-                    "The fresh-card database was created by a newer Share Tools "
-                    f"version (schema {version})."
-                )
+                raise TrackerStorageError("future-schema", self.path)
 
             if version == 0:
+                if self._user_tables(connection):
+                    raise TrackerStorageError("malformed-schema", self.path)
                 connection.executescript(
                     """
                     CREATE TABLE tracker (
@@ -94,6 +123,7 @@ class TrackerDatabase:
                     """
                 )
             elif version == 1:
+                self._validate_schema(connection, EXPECTED_V1_COLUMNS)
                 connection.executescript(
                     """
                     ALTER TABLE tracker
@@ -104,12 +134,14 @@ class TrackerDatabase:
                     """
                 )
 
+            self._validate_schema(connection, EXPECTED_V2_COLUMNS)
+
         self._initialized = True
 
     def load(self) -> Optional[StoredTrackerState]:
         self.initialize()
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             tracker_row = connection.execute(
                 """
                 SELECT locked_scope_query, retention_days
@@ -121,41 +153,57 @@ class TrackerDatabase:
             if tracker_row is None:
                 return None
 
+            locked_scope_query = tracker_row[0]
+            if locked_scope_query is not None and not isinstance(
+                locked_scope_query,
+                str,
+            ):
+                raise TrackerStorageError("corrupt-row", self.path)
+
+            retention_days = self._row_integer(tracker_row[1])
+            if retention_days < 0:
+                raise TrackerStorageError("corrupt-row", self.path)
+
             baseline = tuple(
-                int(row[0])
+                self._row_integer(row[0])
                 for row in connection.execute(
                     "SELECT cid FROM suspended_baseline ORDER BY cid"
                 )
             )
-            events = tuple(
-                StoredUnsuspendEvent(
-                    cid=int(row[0]),
-                    nid=int(row[1]),
-                    detected_at=datetime.fromisoformat(str(row[2])),
-                    scope_query=str(row[3]),
+            events: list[StoredUnsuspendEvent] = []
+            for row in connection.execute(
+                """
+                SELECT cid, nid, detected_at, scope_query
+                FROM fresh_unsuspends
+                ORDER BY detected_at, cid
+                """
+            ):
+                detected_at_value = self._row_string(row[2])
+                try:
+                    detected_at = datetime.fromisoformat(detected_at_value)
+                except ValueError as exc:
+                    raise TrackerStorageError("corrupt-row", self.path) from exc
+
+                events.append(
+                    StoredUnsuspendEvent(
+                        cid=self._row_integer(row[0]),
+                        nid=self._row_integer(row[1]),
+                        detected_at=detected_at,
+                        scope_query=self._row_string(row[3]),
+                    )
                 )
-                for row in connection.execute(
-                    """
-                    SELECT cid, nid, detected_at, scope_query
-                    FROM fresh_unsuspends
-                    ORDER BY detected_at, cid
-                    """
-                )
-            )
 
         return StoredTrackerState(
-            locked_scope_query=(
-                str(tracker_row[0]) if tracker_row[0] is not None else None
-            ),
+            locked_scope_query=locked_scope_query,
             previous_suspended_cids=baseline,
-            captured_events=events,
-            retention_days=int(tracker_row[1]),
+            captured_events=tuple(events),
+            retention_days=retention_days,
         )
 
     def save(self, state: StoredTrackerState) -> None:
         self.initialize()
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 INSERT INTO tracker(singleton, locked_scope_query, retention_days)
@@ -202,7 +250,7 @@ class TrackerDatabase:
     ) -> None:
         self.initialize()
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             connection.executemany(
                 "INSERT OR IGNORE INTO suspended_baseline(cid) VALUES (?)",
                 ((cid,) for cid in baseline_added),
@@ -243,7 +291,7 @@ class TrackerDatabase:
     def remove_events(self, card_ids: set[int]) -> None:
         self.initialize()
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             connection.executemany(
                 "DELETE FROM fresh_unsuspends WHERE cid = ?",
                 ((cid,) for cid in card_ids),
@@ -252,7 +300,7 @@ class TrackerDatabase:
     def clear_events(self) -> None:
         self.initialize()
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             connection.execute("DELETE FROM fresh_unsuspends")
 
     def set_retention_days_and_sweep(
@@ -262,7 +310,7 @@ class TrackerDatabase:
     ) -> int:
         self.initialize()
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             connection.execute(
                 """
                 UPDATE tracker
@@ -284,7 +332,7 @@ class TrackerDatabase:
     def sweep_events_before(self, cutoff: datetime) -> int:
         self.initialize()
 
-        with closing(self._connect()) as connection, connection:
+        with self._connection() as connection:
             cursor = connection.execute(
                 "DELETE FROM fresh_unsuspends WHERE detected_at < ?",
                 (cutoff.isoformat(),),
@@ -293,3 +341,56 @@ class TrackerDatabase:
 
     def _connect(self) -> sqlite3.Connection:
         return sqlite3.connect(self.path)
+
+    @contextmanager
+    def _connection(self) -> Iterator[sqlite3.Connection]:
+        try:
+            with closing(self._connect()) as connection, connection:
+                yield connection
+        except TrackerStorageError:
+            raise
+        except (sqlite3.Error, OSError) as exc:
+            raise TrackerStorageError("database", self.path) from exc
+
+    def _user_tables(self, connection: sqlite3.Connection) -> set[str]:
+        return {
+            self._row_string(row[0])
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+
+    def _validate_schema(
+        self,
+        connection: sqlite3.Connection,
+        expected_columns: dict[str, tuple[tuple[str, str, int, int], ...]],
+    ) -> None:
+        if self._user_tables(connection) != set(expected_columns):
+            raise TrackerStorageError("malformed-schema", self.path)
+
+        for table_name, columns in expected_columns.items():
+            actual_columns = tuple(
+                (
+                    self._row_string(row[1]),
+                    self._row_string(row[2]).upper(),
+                    self._row_integer(row[3]),
+                    self._row_integer(row[5]),
+                )
+                for row in connection.execute(f"PRAGMA table_info({table_name})")
+            )
+            if actual_columns != columns:
+                raise TrackerStorageError("malformed-schema", self.path)
+
+    def _row_integer(self, value: object) -> int:
+        if not isinstance(value, int) or isinstance(value, bool):
+            raise TrackerStorageError("corrupt-row", self.path)
+        return value
+
+    def _row_string(self, value: object) -> str:
+        if not isinstance(value, str):
+            raise TrackerStorageError("corrupt-row", self.path)
+        return value
