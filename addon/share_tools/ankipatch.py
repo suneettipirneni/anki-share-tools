@@ -16,6 +16,7 @@ class CardPatchRow:
     note_guid: str
     card_ord: int
     suspended: bool
+    tags: tuple[str, ...] = ()
 
     def key(self) -> tuple[str, int]:
         return (self.note_guid, self.card_ord)
@@ -56,6 +57,7 @@ def serialize_patch(patch: AnkiPatch) -> str:
                 "note_guid": row.note_guid,
                 "card_ord": row.card_ord,
                 "suspended": row.suspended,
+                "tags": list(row.tags),
             }
             for row in normalize_rows(patch.cards)
         ],
@@ -101,12 +103,14 @@ def card_rows_from_card_ids(col: Any, card_ids: Iterable[int]) -> list[CardPatch
 
     for cid in sorted({int(card_id) for card_id in card_ids}):
         card = col.get_card(cid)
-        note_guid = resolve_note_guid(col, int(card.nid))
+        note_id = int(card.nid)
+        note_guid = resolve_note_guid(col, note_id)
         rows.append(
             CardPatchRow(
                 note_guid=note_guid,
                 card_ord=int(card.ord),
                 suspended=int(card.queue) == SUSPENDED_QUEUE,
+                tags=resolve_note_tags(col, note_id),
             )
         )
 
@@ -333,6 +337,7 @@ def parse_card_row(raw_card: Any, index: int) -> CardPatchRow:
     note_guid = raw_card.get("note_guid")
     card_ord = raw_card.get("card_ord")
     suspended = raw_card.get("suspended")
+    tags = raw_card.get("tags")
 
     if not isinstance(note_guid, str) or not note_guid.strip():
         raise ValueError(f"Invalid card row at index {index}: note_guid is required.")
@@ -347,10 +352,22 @@ def parse_card_row(raw_card: Any, index: int) -> CardPatchRow:
             f"Invalid card row at index {index}: suspended must be true or false."
         )
 
+    if tags is None:
+        tags_tuple: tuple[str, ...] = ()
+    elif not isinstance(tags, list) or not all(
+        isinstance(tag, str) and tag.strip() for tag in tags
+    ):
+        raise ValueError(
+            f"Invalid card row at index {index}: tags must be a list of strings."
+        )
+    else:
+        tags_tuple = tuple(tag.strip() for tag in tags)
+
     return CardPatchRow(
         note_guid=note_guid.strip(),
         card_ord=card_ord,
         suspended=suspended,
+        tags=tags_tuple,
     )
 
 
@@ -365,6 +382,17 @@ def resolve_note_guid(col: Any, note_id: int) -> str:
         raise ValueError(f"Could not resolve note guid for note id {note_id}.")
 
     return str(guid)
+
+
+def resolve_note_tags(col: Any, note_id: int) -> tuple[str, ...]:
+    note = col.get_note(note_id)
+    tags = getattr(note, "tags", None)
+
+    if not isinstance(tags, list):
+        return ()
+
+    normalized = [str(tag).strip() for tag in tags if str(tag).strip()]
+    return tuple(sorted(set(normalized)))
 
 
 def save_collection(col: Any) -> None:
@@ -389,7 +417,9 @@ def optional_str(payload: dict[str, Any], key: str) -> Optional[str]:
 def format_result_line(result: PatchApplyResult) -> str:
     card_id = result.card_id if result.card_id is not None else "not found"
     target = "suspended" if result.row.suspended else "unsuspended"
+    tags = ", ".join(result.row.tags)
+    tags_text = f", tags=[{tags}]" if tags else ""
     return (
         f"- note_guid={result.row.note_guid}, card_ord={result.row.card_ord}, "
-        f"card_id={card_id}, target={target}: {result.message}"
+        f"card_id={card_id}, target={target}{tags_text}: {result.message}"
     )

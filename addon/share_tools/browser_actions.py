@@ -10,6 +10,7 @@ from aqt.qt import (
     QDialog,
     QDialogButtonBox,
     QFileDialog,
+    QHeaderView,
     QInputDialog,
     QLabel,
     QMenu,
@@ -433,6 +434,7 @@ def build_resolved_cards_table(
         "Card Type",
         "Deck",
         "Due",
+        "Patch Tags",
         "Previous State",
         "Target State",
         "Result",
@@ -462,7 +464,7 @@ def build_resolved_cards_table(
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row_index, column_index, item)
 
-    table.resizeColumnsToContents()
+    configure_table_to_fit_width(table)
     return table
 
 
@@ -478,6 +480,7 @@ def resolved_card_result_values(result: PatchApplyResult) -> list[str]:
         get_card_type_name(card),
         get_deck_name(card),
         get_due_text(card),
+        ", ".join(result.row.tags),
         suspended_state_label(result.previous_suspended),
         "Suspended" if result.row.suspended else "Unsuspended",
         result_status_label(result),
@@ -492,6 +495,7 @@ def build_unresolved_rows_table(
     headers = [
         "Patch Note GUID",
         "Patch Card Ord",
+        "Patch Tags",
         "Target State",
         "Result",
         "Details",
@@ -509,6 +513,7 @@ def build_unresolved_rows_table(
         values = [
             result.row.note_guid,
             str(result.row.card_ord),
+            ", ".join(result.row.tags),
             "Suspended" if result.row.suspended else "Unsuspended",
             result_status_label(result),
             result.message,
@@ -519,8 +524,14 @@ def build_unresolved_rows_table(
             item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
             table.setItem(row_index, column_index, item)
 
-    table.resizeColumnsToContents()
+    configure_table_to_fit_width(table)
     return table
+
+
+def configure_table_to_fit_width(table: QTableWidget) -> None:
+    header = table.horizontalHeader()
+    header.setSectionResizeMode(QHeaderView.ResizeMode.Stretch)
+    table.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
 
 
 def suspended_state_label(suspended: Optional[bool]) -> str:
