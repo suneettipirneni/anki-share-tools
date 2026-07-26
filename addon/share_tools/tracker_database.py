@@ -10,6 +10,29 @@ SCHEMA_VERSION = 2
 DEFAULT_RETENTION_DAYS = 30
 
 
+class TrackerMigrationError(RuntimeError):
+    def __init__(
+        self,
+        category: str,
+        source_path: Path,
+        destination_path: Path,
+        quarantine_path: Optional[Path] = None,
+    ) -> None:
+        self.category = category
+        self.source_path = source_path
+        self.destination_path = destination_path
+        self.quarantine_path = quarantine_path
+        message = (
+            f"Tracker migration failed ({category}): "
+            f"{source_path} -> {destination_path}"
+        )
+
+        if quarantine_path is not None:
+            message += f"; destination quarantined at {quarantine_path}"
+
+        super().__init__(message)
+
+
 @dataclass(frozen=True)
 class StoredUnsuspendEvent:
     cid: int

@@ -1,5 +1,6 @@
 from datetime import date, datetime
 import json
+from pathlib import Path
 import sqlite3
 from types import SimpleNamespace
 from typing import Optional
@@ -8,6 +9,11 @@ import pytest
 from anki.errors import NotFoundError
 
 from share_tools import browser_widget
+from share_tools.tracker_database import (
+    StoredTrackerState,
+    TrackerDatabase,
+    TrackerMigrationError,
+)
 from share_tools.unsuspend_tracker import (
     DateRange,
     FreshnessWindow,
@@ -17,6 +23,7 @@ from share_tools.unsuspend_tracker import (
     count_for_window,
     count_for_date_range,
     date_range_for_window,
+    decode_legacy_tracker_state,
     get_captured_cids_for_window,
     get_captured_cids_for_date_range,
     get_captured_events,
@@ -48,6 +55,23 @@ def reset_tracker() -> None:
 
 def cid_to_nid(cid: int) -> int:
     return cid // 10
+
+
+def legacy_tracker_payload() -> dict[str, object]:
+    return {
+        "version": 1,
+        "tracking_enabled": True,
+        "locked_scope_query": "tag:class::cardiology",
+        "previous_suspended_cids": [20],
+        "captured_events": [
+            {
+                "cid": 10,
+                "nid": 1,
+                "detected_at": "2026-06-15T12:00:00",
+                "scope_query": "tag:class::cardiology",
+            }
+        ],
+    }
 
 
 def test_browser_card_resolver_returns_none_only_for_missing_cards(
@@ -604,25 +628,8 @@ def test_initialized_storage_persists_mutations_automatically(tmp_path) -> None:
 def test_initialize_storage_migrates_legacy_json_state(tmp_path) -> None:
     database_path = tmp_path / "tracker.sqlite3"
     legacy_path = tmp_path / "tracker.json"
-    legacy_path.write_text(
-        json.dumps(
-            {
-                "version": 1,
-                "tracking_enabled": True,
-                "locked_scope_query": "tag:class::cardiology",
-                "previous_suspended_cids": [20],
-                "captured_events": [
-                    {
-                        "cid": 10,
-                        "nid": 1,
-                        "detected_at": "2026-06-15T12:00:00",
-                        "scope_query": "tag:class::cardiology",
-                    }
-                ],
-            }
-        ),
-        encoding="utf-8",
-    )
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
 
     initialize_storage(
         database_path,
@@ -646,6 +653,192 @@ def test_initialize_storage_migrates_legacy_json_state(tmp_path) -> None:
             scope_query="tag:class::cardiology",
         )
     ]
+    assert get_retention_days() == 30
+    assert legacy_path.read_bytes() == original_bytes
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        [],
+        {"previous_suspended_cids": [], "captured_events": "invalid"},
+        {
+            "previous_suspended_cids": ["10"],
+            "captured_events": [],
+        },
+        {
+            "previous_suspended_cids": [10, 10],
+            "captured_events": [],
+        },
+        {
+            "previous_suspended_cids": [10],
+            "captured_events": [
+                {
+                    "cid": 10,
+                    "nid": 1,
+                    "detected_at": "2026-06-15T12:00:00",
+                    "scope_query": "deck:current",
+                }
+            ],
+        },
+        {
+            "previous_suspended_cids": [],
+            "captured_events": [
+                {
+                    "cid": 10,
+                    "nid": 1,
+                    "detected_at": "not-a-timestamp",
+                    "scope_query": "deck:current",
+                }
+            ],
+        },
+        {
+            "previous_suspended_cids": [],
+            "captured_events": [],
+            "retention_days": -1,
+        },
+        {
+            "previous_suspended_cids": [],
+            "captured_events": [],
+            "retention_days": True,
+        },
+    ],
+)
+def test_legacy_decoder_rejects_invalid_payloads(payload) -> None:
+    with pytest.raises(ValueError):
+        decode_legacy_tracker_state(payload)
+
+
+def test_legacy_decoder_defaults_missing_retention_to_thirty_days() -> None:
+    state = decode_legacy_tracker_state(legacy_tracker_payload())
+
+    assert state.retention_days == 30
+
+
+def test_malformed_legacy_json_raises_typed_error_without_source_contents(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    secret_contents = '{"private-token":"do-not-echo"'
+    legacy_path.write_text(secret_contents, encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+
+    with pytest.raises(TrackerMigrationError) as error:
+        initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "invalid-payload"
+    assert error.value.source_path == legacy_path
+    assert error.value.destination_path == database_path
+    assert secret_contents not in str(error.value)
+    assert legacy_path.read_bytes() == original_bytes
+    assert not database_path.exists()
+
+
+def test_legacy_source_read_failure_is_typed_and_retryable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+    real_read_text = Path.read_text
+
+    def fail_legacy_read(path: Path, *args, **kwargs) -> str:
+        if path == legacy_path:
+            raise OSError("simulated source failure")
+        return real_read_text(path, *args, **kwargs)
+
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(Path, "read_text", fail_legacy_read)
+        with pytest.raises(TrackerMigrationError) as error:
+            initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "source-read"
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
+
+    initialize_storage(database_path, legacy_path)
+    assert get_locked_scope_query() == "tag:class::cardiology"
+
+
+def test_legacy_destination_write_failure_is_retryable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+
+    def fail_save(
+        _database: TrackerDatabase,
+        _state: StoredTrackerState,
+    ) -> None:
+        raise OSError("simulated write failure")
+
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(TrackerDatabase, "save", fail_save)
+        with pytest.raises(TrackerMigrationError) as error:
+            initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "destination-write"
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
+
+    initialize_storage(database_path, legacy_path)
+    assert get_locked_scope_query() == "tag:class::cardiology"
+
+
+def test_legacy_destination_readback_mismatch_is_retryable(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    legacy_path.write_text(json.dumps(legacy_tracker_payload()), encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+    real_load = TrackerDatabase.load
+    load_count = 0
+
+    def mismatch_on_readback(database: TrackerDatabase):
+        nonlocal load_count
+        load_count += 1
+        state = real_load(database)
+        if load_count == 2:
+            return StoredTrackerState(None, (), (), 30)
+        return state
+
+    with monkeypatch.context() as migration_patch:
+        migration_patch.setattr(TrackerDatabase, "load", mismatch_on_readback)
+        with pytest.raises(TrackerMigrationError) as error:
+            initialize_storage(database_path, legacy_path)
+
+    assert error.value.category == "verification"
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
+
+    initialize_storage(database_path, legacy_path)
+    assert get_locked_scope_query() == "tag:class::cardiology"
+
+
+def test_failed_migration_quarantines_preexisting_empty_destination(
+    tmp_path,
+) -> None:
+    database_path = tmp_path / "tracker.sqlite3"
+    legacy_path = tmp_path / "tracker.json"
+    TrackerDatabase(database_path).load()
+    legacy_path.write_text("invalid json", encoding="utf-8")
+    original_bytes = legacy_path.read_bytes()
+
+    with pytest.raises(TrackerMigrationError) as error:
+        initialize_storage(database_path, legacy_path)
+
+    assert error.value.quarantine_path is not None
+    assert error.value.quarantine_path.exists()
+    assert not database_path.exists()
+    assert legacy_path.read_bytes() == original_bytes
 
 
 def test_retention_setting_and_sweep_persist_across_restarts(tmp_path) -> None:

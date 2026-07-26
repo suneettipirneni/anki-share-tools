@@ -10,6 +10,7 @@ from .tracker_database import (
     StoredTrackerState,
     StoredUnsuspendEvent,
     TrackerDatabase,
+    TrackerMigrationError,
 )
 
 
@@ -339,24 +340,71 @@ def initialize_storage(
     global _database
 
     shutdown_storage(clear_runtime=True)
+    destination_existed = database_path.exists()
     database = TrackerDatabase(database_path)
     stored_state = database.load()
-    _database = database
 
     if stored_state is not None:
+        _database = database
         apply_stored_state(stored_state)
         sweep_expired_events(now)
         return
 
     if legacy_json_path is not None and legacy_json_path.exists():
         try:
-            apply_state(json.loads(legacy_json_path.read_text(encoding="utf-8")))
-            sweep_expired_events(now)
-            return
-        except (OSError, ValueError, TypeError, KeyError):
-            clear_all()
-            return
+            legacy_contents = legacy_json_path.read_text(encoding="utf-8")
+        except OSError as exc:
+            raise _build_migration_error(
+                category="source-read",
+                source_path=legacy_json_path,
+                destination_path=database_path,
+                destination_existed=destination_existed,
+            ) from exc
 
+        try:
+            decoded_state = decode_legacy_tracker_state(json.loads(legacy_contents))
+        except (ValueError, TypeError, KeyError) as exc:
+            raise _build_migration_error(
+                category="invalid-payload",
+                source_path=legacy_json_path,
+                destination_path=database_path,
+                destination_existed=destination_existed,
+            ) from exc
+
+        try:
+            database.save(decoded_state)
+        except Exception as exc:
+            raise _build_migration_error(
+                category="destination-write",
+                source_path=legacy_json_path,
+                destination_path=database_path,
+                destination_existed=destination_existed,
+            ) from exc
+
+        try:
+            reloaded_state = database.load()
+        except Exception as exc:
+            raise _build_migration_error(
+                category="destination-readback",
+                source_path=legacy_json_path,
+                destination_path=database_path,
+                destination_existed=destination_existed,
+            ) from exc
+
+        if reloaded_state != decoded_state:
+            raise _build_migration_error(
+                category="verification",
+                source_path=legacy_json_path,
+                destination_path=database_path,
+                destination_existed=destination_existed,
+            )
+
+        _database = database
+        apply_stored_state(decoded_state)
+        sweep_expired_events(now)
+        return
+
+    _database = database
     persist_state()
 
 
@@ -446,26 +494,150 @@ def save_state(path: Path) -> None:
 
 
 def apply_state(state: dict[str, Any]) -> None:
-    global _locked_scope_query, _retention_days
+    apply_stored_state(decode_legacy_tracker_state(state))
+    persist_state()
 
-    _clear_runtime_state()
-    _locked_scope_query = state.get("locked_scope_query")
-    _retention_days = int(state.get("retention_days", DEFAULT_RETENTION_DAYS))
-    set_tracking_enabled(_locked_scope_query is not None)
-    _previous_suspended_cids.update(
-        int(cid) for cid in state.get("previous_suspended_cids", [])
+
+def decode_legacy_tracker_state(payload: object) -> StoredTrackerState:
+    if not isinstance(payload, dict):
+        raise ValueError("Legacy tracker payload must be an object.")
+
+    version = payload.get("version")
+    if version is not None and not _is_integer(version):
+        raise ValueError("Legacy tracker version must be an integer.")
+
+    tracking_enabled = payload.get("tracking_enabled")
+    if tracking_enabled is not None and not isinstance(tracking_enabled, bool):
+        raise ValueError("Legacy tracking_enabled must be a boolean.")
+
+    locked_scope_query = payload.get("locked_scope_query")
+    if locked_scope_query is not None and not isinstance(locked_scope_query, str):
+        raise ValueError("Legacy locked_scope_query must be a string or null.")
+
+    raw_baseline = payload.get("previous_suspended_cids")
+    if not isinstance(raw_baseline, list):
+        raise ValueError("Legacy previous_suspended_cids must be an array.")
+
+    baseline: list[int] = []
+    seen_card_ids: set[int] = set()
+    for raw_cid in raw_baseline:
+        cid = _require_integer(raw_cid, "baseline card ID")
+        if cid in seen_card_ids:
+            raise ValueError("Legacy tracker payload contains duplicate card IDs.")
+        seen_card_ids.add(cid)
+        baseline.append(cid)
+
+    raw_events = payload.get("captured_events")
+    if not isinstance(raw_events, list):
+        raise ValueError("Legacy captured_events must be an array.")
+
+    events: list[StoredUnsuspendEvent] = []
+    for raw_event in raw_events:
+        if not isinstance(raw_event, dict):
+            raise ValueError("Each legacy captured event must be an object.")
+
+        cid = _require_integer(raw_event.get("cid"), "event card ID")
+        if cid in seen_card_ids:
+            raise ValueError("Legacy tracker payload contains duplicate card IDs.")
+        seen_card_ids.add(cid)
+        nid = _require_integer(raw_event.get("nid"), "event note ID")
+        detected_at_value = raw_event.get("detected_at")
+        if not isinstance(detected_at_value, str):
+            raise ValueError("Legacy event detected_at must be a timestamp string.")
+
+        try:
+            detected_at = datetime.fromisoformat(detected_at_value)
+        except ValueError as exc:
+            raise ValueError(
+                "Legacy event detected_at must be a valid ISO timestamp."
+            ) from exc
+
+        scope_query = raw_event.get("scope_query")
+        if not isinstance(scope_query, str):
+            raise ValueError("Legacy event scope_query must be a string.")
+
+        events.append(
+            StoredUnsuspendEvent(
+                cid=cid,
+                nid=nid,
+                detected_at=detected_at,
+                scope_query=scope_query,
+            )
+        )
+
+    retention_days = _require_integer(
+        payload.get("retention_days", DEFAULT_RETENTION_DAYS),
+        "retention_days",
+    )
+    if retention_days < 0:
+        raise ValueError("Legacy retention_days cannot be negative.")
+
+    return StoredTrackerState(
+        locked_scope_query=locked_scope_query,
+        previous_suspended_cids=tuple(sorted(baseline)),
+        captured_events=tuple(
+            sorted(events, key=lambda event: (event.detected_at.isoformat(), event.cid))
+        ),
+        retention_days=retention_days,
     )
 
-    for raw_event in state.get("captured_events", []):
-        event = UnsuspendEvent(
-            cid=int(raw_event["cid"]),
-            nid=int(raw_event["nid"]),
-            detected_at=datetime.fromisoformat(raw_event["detected_at"]),
-            scope_query=str(raw_event["scope_query"]),
-        )
-        _captured_events_by_cid[event.cid] = event
 
-    persist_state()
+def _is_integer(value: object) -> bool:
+    return isinstance(value, int) and not isinstance(value, bool)
+
+
+def _require_integer(value: object, field_name: str) -> int:
+    if not _is_integer(value):
+        raise ValueError(f"Legacy {field_name} must be an integer.")
+    return int(value)
+
+
+def _build_migration_error(
+    category: str,
+    source_path: Path,
+    destination_path: Path,
+    destination_existed: bool,
+) -> TrackerMigrationError:
+    try:
+        quarantine_path = _discard_failed_migration_destination(
+            destination_path,
+            destination_existed,
+        )
+    except OSError:
+        return TrackerMigrationError(
+            category="destination-cleanup",
+            source_path=source_path,
+            destination_path=destination_path,
+        )
+
+    return TrackerMigrationError(
+        category=category,
+        source_path=source_path,
+        destination_path=destination_path,
+        quarantine_path=quarantine_path,
+    )
+
+
+def _discard_failed_migration_destination(
+    database_path: Path,
+    destination_existed: bool,
+) -> Optional[Path]:
+    if not database_path.exists():
+        return None
+
+    if not destination_existed:
+        database_path.unlink()
+        return None
+
+    quarantine_path = database_path.with_name(f"{database_path.name}.migration-failed")
+    suffix = 1
+    while quarantine_path.exists():
+        quarantine_path = database_path.with_name(
+            f"{database_path.name}.migration-failed-{suffix}"
+        )
+        suffix += 1
+    database_path.replace(quarantine_path)
+    return quarantine_path
 
 
 def apply_stored_state(state: StoredTrackerState) -> None:
